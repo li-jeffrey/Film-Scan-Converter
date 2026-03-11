@@ -18,8 +18,12 @@ Quick Links:
 
 Developer documentation and contribution guidelines are available in the [docs/developer-guide.md](docs/development/index.md) file.
 
+## ART Integration
+
+Film scan converter can be integrated into [Art Raw Editor](https://artraweditor.github.io) to provide quick and convenient access to opening full folders, individuals files and multiple selected files. The documentation on how to install art and how to use the integration is located in [docs/how-to-add-to-ART.md](docs/how-to-add-to-ART.md).
+
 ## Contributing
 
 If you're reading this, thanks for helping me take this project further beyond what I can accomplish on my own. The analog community has long been deprived of a free, intuitive, and standalone film inversion application, and your contribution will help film photography be more accessible to many more people.
 
-Please continue reading in the [contributing](docs/development/contributing.md) chapter.
+Please continue reading in the [contributing](docs/contributing.md) chapter.
