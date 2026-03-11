@@ -1,0 +1,3 @@
+[ART UserCommand]
+Label=Film Scan Converter
+Command=./film_scan_converter_files.sh

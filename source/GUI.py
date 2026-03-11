@@ -10,6 +10,8 @@ import numpy as np
 import cv2
 import multiprocessing
 from typing import Literal
+from os.path import dirname
+import glob
 
 #custom classes
 from CustomWidgets import ScrollFrame, ScaleEntry, CheckLabel, ComboLabel, MultiEntryLabel
@@ -23,7 +25,7 @@ FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
 logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 
 class GUI:
-    def __init__(self, master):
+    def __init__(self, master, output_directory=None):
         # Initialize Variables
         self.config_path = self._check_and_create_conf_folder()
         self.photos = []
@@ -174,7 +176,7 @@ class GUI:
         if getattr(sys, 'frozen', False):
             picker = tk.PhotoImage(file=os.path.join(sys._MEIPASS, 'dropper.png')).subsample(15,15)
         else:
-            picker = tk.PhotoImage(file=os.path.join('assets', 'dropper.png')).subsample(15,15)
+            picker = tk.PhotoImage(file=os.path.join(dirname(__file__), 'assets/dropper.png')).subsample(15,15)
         colour_title = ttk.Label(text='Colour Adjustment', font=self.header_style, padding=2)
         self.colourFrame = ttk.LabelFrame(dynamic_scroll_frame.frame, borderwidth=2, labelwidget=colour_title, padding=5)
         colour_controls = ttk.Frame(self.colourFrame)
@@ -306,6 +308,24 @@ class GUI:
         for widget in self.widgets.values():
             if widget.key in self.default_settings:
                 widget.set(self.default_settings[widget.key]) # initializes widgets with default settings
+
+        if output_directory != None:
+            self.set_destination_folder(output_directory)
+
+    def load_all_from_path(self, pathname):
+        # Load all compatible files from the given path
+        print(f'Loading path: {pathname}')
+        extensions = self.allowable_image_filetypes[0][1].split()
+        extensions.extend(self.allowable_image_filetypes[1][1].split())
+        files = []
+
+        for extension in extensions:
+            files.extend(glob.glob(os.path.join(pathname, extension)))
+
+        files = remove_duplicate_strings(files)
+
+        if len(files) > 0:
+            self.import_from_filenames(files)
     
     def _check_and_create_conf_folder(self) -> str:
         '''
@@ -498,32 +518,51 @@ class GUI:
         if len(filenames) == 0:
             return # if user clicks 'cancel', abort operation
         
-        self.show_progress('Initializing import...') # display progress opening
+        self.import_from_filenames(filenames)
+
+    def import_from_filenames(self, filenames):
+        # Import all files from the given string list
+        self.show_progress('Initializing import...')  # display progress opening
         self.import_button.configure(state=tk.DISABLED)
         self.filemenu.entryconfigure('Import...', state=tk.DISABLED)
-        
+
         total = len(filenames)
         self.photos = []
         photo_names = []
-        
+
         self.update_progress(20, f'Initializing {str(total)} photos...')
+        
         for i, filename in enumerate(filenames):
-            photo = RawProcessing(file_directory=filename, default_settings=self.default_settings, global_settings=self.global_settings, config_path=self.config_path)
+            print(f'Loading file: {filename}')
+            photo = RawProcessing(
+                file_directory=filename,
+                default_settings=self.default_settings,
+                global_settings=self.global_settings,
+                config_path=self.config_path,
+            )
             self.photos.append(photo)
             photo_names.append(f'{str(i + 1)}. {str(photo)}')
-        
+
         self.update_progress(80, 'Configuring GUI...')
-        self.photoCombo.configure(values=photo_names) # configures dropdown to include list of photos
-        self.photoCombo.current(0) # select the first photo to display
+        
+        self.photoCombo.configure(
+            values=photo_names
+        )  # configures dropdown to include list of photos
+
+        self.photoCombo.current(0)  # select the first photo to display
 
         self.update_progress(90, 'Loading photo...')
-        self.load_IMG() # configure GUI to display the first photo
+        self.load_IMG()  # configure GUI to display the first photo
         self.update_progress(99)
         self.import_button.configure(state=tk.NORMAL)
         self.filemenu.entryconfigure('Import...', state=tk.NORMAL)
         self.update_UI()
-        if self.glob_check.get() and self.global_settings != self.default_settings: # check if global settings are different from default on import
-            self.unsaved = True # if it is the default, then it doesn't need to be saved
+        if (
+            self.glob_check.get() and self.global_settings != self.default_settings
+        ):  # check if global settings are different from default on import
+            self.unsaved = (
+                True  # if it is the default, then it doesn't need to be saved
+            )
         else:
             self.unsaved = False
         self.hide_progress()
@@ -539,6 +578,7 @@ class GUI:
 
         if len(self.photos) == 0:
             return
+
         photo_index = self.photoCombo.current()
         self.current_photo = self.photos[photo_index]
         self.glob_check.set(self.current_photo.use_global_settings)
@@ -955,8 +995,14 @@ class GUI:
         destination_folder = filedialog.askdirectory() + '/' # opens dialog to choose folder
         if len(destination_folder) <= 1: # no input is given
             return
+            
+        self.set_destination_folder(destination_folder)
+
+    def set_destination_folder(self, destination_folder):
         self.destination_folder = destination_folder
-        self.destination_folder_text.set(self.destination_folder) # display destination folder in GUI
+        self.destination_folder_text.set(
+            self.destination_folder
+        )  # display destination folder in GUI
 
     def export(self, n_photos=1):
         # Start export in seperate thread to keep UI responsive
@@ -1243,3 +1289,16 @@ class GUI:
                 photo.clear_memory()
                 return False
         return error
+
+def remove_duplicate_strings(strings):
+    # Remove duplicate strings from a list ignoring case
+    seen = set()
+    result = []
+
+    for s in strings:
+        lower = s.lower()
+        if lower not in seen:
+            seen.add(lower)
+            result.append(s)
+
+    return result
