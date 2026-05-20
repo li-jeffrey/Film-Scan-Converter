@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Film Scan Converter",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/source/Film Scan Converter.pyw",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Film Scan Converter (Lightroom Edit In)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/source/Film Scan Converter.pyw",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "args": ["${input:editInImagePath}"],
+      "justMyCode": true
+    },
+    {
+      "name": "Python: Current File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "editInImagePath",
+      "type": "promptString",
+      "description": "Path to the image file Lightroom passes on Edit In",
+      "default": "C:\\path\\to\\scan.tif"
+    }
+  ]
+}
