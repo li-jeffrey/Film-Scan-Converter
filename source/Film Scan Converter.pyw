@@ -11,18 +11,36 @@ from GUI import GUI
 
 
 def getopts():
-    p = argparse.ArgumentParser()
-    p.add_argument('-d', '--directory', help='load this directory on open')
-    p.add_argument('-o', '--output_directory', help='set an output directory')
-    p.add_argument('-f', '--file', help='open one or more files on launch')
+    p = argparse.ArgumentParser(
+        description='Film Scan Converter. Pass a TIFF path when launched from Lightroom Edit In.'
+    )
+    p.add_argument(
+        'image_path',
+        nargs='?',
+        help='16-bit TIFF from Lightroom Edit In (overwritten on save)',
+    )
     return p.parse_args()
+
+
+def resolve_lightroom_path(image_path):
+    if not image_path:
+        return None
+    path = os.path.abspath(image_path.strip().strip('"'))
+    if not os.path.isfile(path):
+        print(f'Error: file not found: {path}', file=sys.stderr)
+        sys.exit(1)
+    if os.path.splitext(path)[1].lower() not in ('.tif', '.tiff'):
+        print(f'Error: Lightroom Edit In requires a TIFF file: {path}', file=sys.stderr)
+        sys.exit(1)
+    return path
 
 
 logger = logging.getLogger(__name__)
 FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
 logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 opts = getopts()
-   
+lightroom_path = resolve_lightroom_path(opts.image_path)
+
 if __name__ == '__main__':
     # Main function
     multiprocessing.freeze_support()
@@ -49,19 +67,10 @@ if __name__ == '__main__':
         root = tk.Tk()
         root.iconbitmap(default=resource_path(datafile))
 
-    window = GUI(root, opts.output_directory)
+    window = GUI(root, lightroom_path=lightroom_path)
 
-    # If a directory argument has been passed then load it after the mainloop starts
-    if opts.directory is not None:
+    if lightroom_path is not None:
         root.after(0, window.resize_UI)
-        root.after(0, window.load_all_from_path, opts.directory)
-
-    # If a file argument has been passed and a directory argument has not then load
-    # them after mainloop starts
-    if (opts.file is not None) and (opts.directory is None):
-        filenames = opts.file.split(',')        
-        filenames[:] = [name.strip() for name in filenames if os.path.isfile(name.strip())]
-        root.after(0, window.resize_UI)
-        root.after(0, window.import_from_filenames, filenames)
+        root.after(0, window.import_lightroom_edit_in, lightroom_path)
 
     root.mainloop()

@@ -44,7 +44,7 @@ class RawProcessing:
     advanced_attrs = [key for key in default_parameters.keys() if key not in ('filetype', 'frame', 'fit_aspect_ratio')] # list of keys for advanced settings, except for keys that should not be saved
     processing_parameters = ('dark_threshold','light_threshold','border_crop','flip','rotation','film_type','white_point','black_point','gamma','shadows','highlights','temp','tint','sat','reject','base_detect','base_rgb','remove_dust')
     
-    def __init__(self, file_directory, default_settings, global_settings, config_path):
+    def __init__(self, file_directory, default_settings, global_settings, config_path, lightroom_edit_in):
         # file_directory: the name of the RAW file to be processed
         # Instance Variables
         self.processed = False # flag for whether the image has been processed yet
@@ -56,6 +56,7 @@ class RawProcessing:
         self.filename = os.path.basename(self.file_directory)
         self.colour_desc = None # RAW bayer colour description
         self.config_path = config_path
+        self.lightroom_edit_in = lightroom_edit_in
         # initializing raw processing parameters
         try: # to read in the parameters from a saved file
             directory = os.path.join(self.config_path, f"{self.filename.split('.')[0]}.npy")
@@ -81,6 +82,9 @@ class RawProcessing:
     
     def load(self, full_res=False):
         # Loads the RAW file into memory
+        if self.lightroom_edit_in:
+            self._load_lightroom_tiff()
+            return
         try:
             with rawpy.imread(self.file_directory) as raw: # tries to read as raw file
                 self.RAW_IMG = raw.postprocess(
@@ -125,29 +129,57 @@ class RawProcessing:
         self.FileReadError = False
         self.memory_alloc = self.RAW_IMG.nbytes * 4 * 12 # estimation of memory requirements based on the size of the image
 
-    def get_IMG(self, output=None, as_array=False):
-        # Returns the converted image at different stages of the process, based on desired output
-        if self.FileReadError: # Return nothing when file could not be read
+    def _load_lightroom_tiff(self):
+        # 16-bit TIFF from Lightroom (uncompressed or LZW; ProPhoto RGB / Display P3 ICC)
+        try:
+            with Image.open(self.file_directory) as pil_img:
+                self.tiff_icc_profile = pil_img.info.get('icc_profile')
+                comp_tag = pil_img.tag_v2.get(259) if hasattr(pil_img, 'tag_v2') else None
+                self.tiff_compression_tag = comp_tag  # 1 = none, 5 = LZW
+
+                arr = np.asarray(pil_img)
+                if arr.ndim == 2:
+                    arr = np.stack([arr, arr, arr], axis=-1)
+                elif arr.ndim == 3 and arr.shape[2] == 4:
+                    arr = arr[:, :, :3]
+                if arr.dtype == np.uint8:
+                    arr = arr.astype(np.uint16) * 256
+                elif arr.dtype != np.uint16:
+                    arr = np.clip(arr, 0, 65535).astype(np.uint16)
+
+                if arr.shape[-1] < 3:
+                    raise ValueError('TIFF must have at least three colour channels')
+                self.RAW_IMG = np.ascontiguousarray(arr[:, :, :3][:, :, ::-1])  # RGB -> BGR
+        except Exception as e:
+            logger.exception(f'Exception: {e}')
+            self.reject = True
+            self.FileReadError = True
+            return
+
+        self.FileReadError = False
+        self.memory_alloc = self.RAW_IMG.nbytes * 4 * 12
+
+    def _render_image(self, output=None):
+        # Returns a numpy array for the requested processing stage (export or preview source).
+        if self.FileReadError:
             return
         match output:
-            case 'RAW': # return RAW image
-                img = self.rotate(self.RAW_IMG) # apply rotation to image
-            case 'Threshold': # return threshold image
-                img = self.thresh
-                img = self.rotate(img) # apply rotation to image
-            case 'Contours': # generate contour image, then return it
+            case 'RAW':
+                img = self.rotate(self.RAW_IMG)
+            case 'Threshold':
+                img = self.rotate(self.thresh)
+            case 'Contours':
                 thresh_img = np.uint8(cv2.cvtColor(self.thresh, cv2.COLOR_GRAY2BGR) / 2)
-                thresh_img[:,:,2] = 0 # sets colour of threshold image
+                thresh_img[:,:,2] = 0
 
                 indices = np.indices(thresh_img.shape[:2])
                 zebra_width = int(np.max(indices) / 100)
                 zebra = np.repeat((np.mod(indices[0] + indices[1], zebra_width * 2) > zebra_width)[:, :, np.newaxis], 3, axis=2)
-                thresh_img = np.where(zebra, 0, thresh_img) # applies zebra pattern to threshold image
-                img = cv2.addWeighted(cv2.convertScaleAbs(self.RAW_IMG, alpha=(255.0/65535.0)), 1, thresh_img, 0.2, 0) # add threshold image to RAW
+                thresh_img = np.where(zebra, 0, thresh_img)
+                img = cv2.addWeighted(cv2.convertScaleAbs(self.RAW_IMG, alpha=(255.0/65535.0)), 1, thresh_img, 0.2, 0)
 
-                # drawing crop boxes
                 if self.rect is not None:
-                    border_width = np.ceil((img.shape[0] + img.shape[1]) / 800) # border width proportional to image size
+                    border_width = np.ceil((img.shape[0] + img.shape[1]) / 800)
                     if img.shape[0] > img.shape[1]:
                         x_crop = self.border_crop
                         y_crop = self.border_crop * img.shape[1] / img.shape[0]
@@ -168,30 +200,39 @@ class RawProcessing:
                     EQ_ignore_poly = np.zeros_like(img)
                     cv2.fillPoly(EQ_ignore_poly, [extra_crop_box], (0,0,255))
                     cv2.fillPoly(EQ_ignore_poly, [EQ_ignore_box], (0,0,0))
-                    img = np.where(np.dstack([np.sum(EQ_ignore_poly, (2)) == 0]*3), img, cv2.addWeighted(EQ_ignore_poly, 2, img, 0.8, 0)) # shaded zone where EQ calcs are ignored
-                    
-                    cv2.drawContours(img,[box],0,(0,255,255), int(border_width * 0.75)) # original crop
-                    cv2.drawContours(img, self.largest_contour, -1, (0,255,255), int(border_width * .75)) # largest contour
-                    cv2.drawContours(img,[extra_crop_box],0,(0,255,0), int(border_width)) # extra border crop
-                img = self.rotate(img) # apply rotation to image
-            case 'Histogram': # returns histogram of preview image
+                    img = np.where(np.dstack([np.sum(EQ_ignore_poly, (2)) == 0]*3), img, cv2.addWeighted(EQ_ignore_poly, 2, img, 0.8, 0))
+
+                    cv2.drawContours(img,[box],0,(0,255,255), int(border_width * 0.75))
+                    cv2.drawContours(img, self.largest_contour, -1, (0,255,255), int(border_width * .75))
+                    cv2.drawContours(img,[extra_crop_box],0,(0,255,0), int(border_width))
+                img = self.rotate(img)
+            case 'Histogram':
                 img = self.draw_histogram(self.IMG)
                 img = np.flip(img, 0)
                 mask = np.sum(img, 2) == 0
                 img[mask] = np.array(self.class_parameters['hist_bg_colour'])
-            case _: # default case, return preview image
+            case _:
                 img = self.IMG
                 if self.remove_dust:
                     img = self.fill_dust(img, self.dust_mask)
-                img = self.add_frame(img) # add decorative white frame
-                img = self.rotate(img) # apply rotation to image
-        if as_array:
-            return img
-        else:
-            if img.dtype == 'uint16':
-                img = cv2.convertScaleAbs(img, alpha=(255.0/65535.0))
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # Convert back to RGB
-            return Image.fromarray(img) # convert image to tkinter-friendly image
+                img = self.add_frame(img)
+                img = self.rotate(img)
+        return img
+
+    def get_export_img(self):
+        # Full-resolution numpy image for disk export (16-bit, BGR or grayscale).
+        return self._render_image()
+
+    def get_preview_img(self, output=None):
+        # 8-bit PIL image for GUI display (downscaled separately via resize_IMG).
+        img = self._render_image(output)
+        if img is None:
+            return
+        if img.dtype == np.uint16:
+            img = cv2.convertScaleAbs(img, alpha=(255.0/65535.0))
+        if img.ndim == 2:
+            return Image.fromarray(img, mode='L')
+        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         
     def __str__(self):
         # returns file name when str() is called on photo
@@ -199,10 +240,13 @@ class RawProcessing:
     
     def export(self, filename):
         # Saves final image to disk.
-        # filename is a string containing the directory and file name with the file extension
+        # filename: base path without extension (standard export), full path for Lightroom Edit In (16-bit TIFF, preserves ICC)
         if not hasattr(self, 'IMG'):
             return
-        img = self.get_IMG(as_array=True)
+        img = self.get_export_img()
+        if self.lightroom_edit_in:
+            self._export_lightroom_tiff(filename, img)
+            return
         filename = f"{filename}.{self.class_parameters['filetype']}"
         match self.class_parameters['filetype']:
             case 'JPG':
@@ -213,6 +257,17 @@ class RawProcessing:
                 cv2.imwrite(filename, img, quality)
             case _:
                 cv2.imwrite(filename, img)
+
+    def _export_lightroom_tiff(self, path, img):
+        if img.ndim == 2:
+            pil_img = Image.fromarray(img, mode='I;16')
+        else:
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        compression = 'tiff_lzw' if getattr(self, 'tiff_compression_tag', None) == 5 else 'raw'
+        save_kwargs = {'format': 'TIFF', 'compression': compression}
+        if getattr(self, 'tiff_icc_profile', None):
+            save_kwargs['icc_profile'] = self.tiff_icc_profile
+        pil_img.save(path, **save_kwargs)
 
     def save_settings(self):
         # saves the processing parameters to a file

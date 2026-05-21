@@ -25,8 +25,10 @@ FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
 logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 
 class GUI:
-    def __init__(self, master, output_directory=None):
+    def __init__(self, master, lightroom_path=None):
         # Initialize Variables
+        self.lightroom_edit_in = lightroom_path is not None
+        self.lightroom_path = lightroom_path
         self.config_path = self._check_and_create_conf_folder()
         self.photos = []
         self.in_progress = set() # keeps track photos that are in processing when first loading
@@ -116,10 +118,12 @@ class GUI:
         importFrame.grid(row=0, column=0, sticky='EW')
         importSubFrame1 = ttk.Frame(importFrame)
         importSubFrame1.pack(fill='x')
-        ttk.Label(importSubFrame1, text='RAW File:').pack(side=tk.LEFT)
+        self.import_file_label = ttk.Label(importSubFrame1, text='RAW File:')
+        self.import_file_label.pack(side=tk.LEFT)
         self.photoCombo = ttk.Combobox(importSubFrame1, state='readonly')
         self.photoCombo.bind('<<ComboboxSelected>>', self.load_IMG)
         self.photoCombo.pack(side=tk.LEFT, padx=2)
+        self.lightroom_filename_lbl = ttk.Label(importSubFrame1, font=('Segoe UI', 9))
         self.import_button = ttk.Button(importSubFrame1, text='Import...', command=self.import_photos, width=8)
         self.import_button.pack(side=tk.LEFT, padx=2)
         importSubFrame2 = ttk.Frame(importFrame)
@@ -221,18 +225,20 @@ class GUI:
         export_frame.grid(row=9, column=0, sticky='EW')
         export_settings_frame = ttk.Frame(export_frame)
         export_settings_frame.pack(fill='x')
-        ComboLabel(export_settings_frame, 'Export File Type:', 0, self.filetypes, 'filetype', global_sync=False, output_list=self.filetypes, command=lambda widget:self.widget_changed(widget, 'skip', False), default_value=RawProcessing.default_parameters['filetype'])
+        self.export_filetype_widget = ComboLabel(export_settings_frame, 'Export File Type:', 0, self.filetypes, 'filetype', global_sync=False, output_list=self.filetypes, command=lambda widget:self.widget_changed(widget, 'skip', False), default_value=RawProcessing.default_parameters['filetype'])
         self.frame = ScaleEntry(export_settings_frame, 'White Frame (%):', 1, 0, 10, 'frame', global_sync=False, command=lambda widget:self.widget_changed(widget, 'update', False), default_value=RawProcessing.default_parameters['frame'])
         ComboLabel(export_settings_frame, 'Fit Aspect Ratio:', 2, self.fit_aspect_ratios, 'fit_aspect_ratio', global_sync=False, output_list=self.fit_aspect_ratios, command=lambda widget:self.widget_changed(widget, 'update', False), default_value=RawProcessing.default_parameters['fit_aspect_ratio'], width=20)
         export_settings_frame.pack(fill='x', pady=(0, 15)) # adds some spacing
         
-        ttk.Label(export_frame, text='Output Destination Folder:', anchor='w').pack(fill = 'x')
+        self.export_destination_heading = ttk.Label(export_frame, text='Output Destination Folder:', anchor='w')
+        self.export_destination_heading.pack(fill='x')
         self.destination_folder_text = tk.StringVar()
         self.destination_folder_text.set('No Destination Folder Specified')
-        destination_lbl = ttk.Label(export_frame, textvariable=self.destination_folder_text, anchor='w', font=('Segoe UI', 9, 'italic'))
-        destination_lbl.pack(fill = 'x')
-        destination_lbl.bind('<Configure>', lambda e: destination_lbl.config(wraplength=destination_lbl.winfo_width()))
-        ttk.Button(export_frame, text='Select Folder', command=self.select_folder).pack(side=tk.LEFT, padx=2, pady=5)
+        self.export_destination_lbl = ttk.Label(export_frame, textvariable=self.destination_folder_text, anchor='w', font=('Segoe UI', 9, 'italic'))
+        self.export_destination_lbl.pack(fill='x')
+        self.export_destination_lbl.bind('<Configure>', lambda e: self.export_destination_lbl.config(wraplength=self.export_destination_lbl.winfo_width()))
+        self.select_folder_button = ttk.Button(export_frame, text='Select Folder', command=self.select_folder)
+        self.select_folder_button.pack(side=tk.LEFT, padx=2, pady=5)
         self.current_photo_button = ttk.Button(export_frame, text='Export Current Photo', command=self.export, state=tk.DISABLED)
         self.current_photo_button.pack(side=tk.LEFT, padx=2, pady=5)
         self.all_photo_button = ttk.Button(export_frame, text='Export All Photos', command=lambda: self.export(len(self.photos)), state=tk.DISABLED)
@@ -309,8 +315,29 @@ class GUI:
             if widget.key in self.default_settings:
                 widget.set(self.default_settings[widget.key]) # initializes widgets with default settings
 
-        if output_directory != None:
-            self.set_destination_folder(output_directory)
+        if self.lightroom_edit_in:
+            self._configure_lightroom_edit_in_ui()
+
+    def _configure_lightroom_edit_in_ui(self):
+        RawProcessing.class_parameters['filetype'] = 'TIFF'
+        self.master.title(f'Film Scan Converter — {os.path.basename(self.lightroom_path)}')
+        self.import_file_label.configure(text='File:')
+        self.photoCombo.pack_forget()
+        self.import_button.pack_forget()
+        self.filemenu.entryconfigure('Import...', state=tk.DISABLED)
+        self.prevButton.pack_forget()
+        self.nextButton.pack_forget()
+        self.export_destination_heading.pack_forget()
+        self.export_destination_lbl.pack_forget()
+        self.select_folder_button.pack_forget()
+        self.all_photo_button.pack_forget()
+        self.export_filetype_widget.hide()
+        self.current_photo_button.configure(text='Save to Lightroom')
+
+    def import_lightroom_edit_in(self, path):
+        self.lightroom_filename_lbl.configure(text=os.path.basename(path))
+        self.lightroom_filename_lbl.pack(side=tk.LEFT, padx=2, fill='x', expand=True)
+        self.import_from_filenames((path,))
 
     def load_all_from_path(self, pathname):
         # Load all compatible files from the given path
@@ -507,6 +534,8 @@ class GUI:
     
     def import_photos(self):
         # Import photos: opens dialog to load files, and intializes GUI
+        if self.lightroom_edit_in:
+            return
         if len(self.photos) > 0:
             if self.ask_save_settings() is None:
                 return
@@ -539,6 +568,7 @@ class GUI:
                 default_settings=self.default_settings,
                 global_settings=self.global_settings,
                 config_path=self.config_path,
+                lightroom_edit_in=self.lightroom_edit_in
             )
             self.photos.append(photo)
             photo_names.append(f'{str(i + 1)}. {str(photo)}')
@@ -554,8 +584,9 @@ class GUI:
         self.update_progress(90, 'Loading photo...')
         self.load_IMG()  # configure GUI to display the first photo
         self.update_progress(99)
-        self.import_button.configure(state=tk.NORMAL)
-        self.filemenu.entryconfigure('Import...', state=tk.NORMAL)
+        if not self.lightroom_edit_in:
+            self.import_button.configure(state=tk.NORMAL)
+            self.filemenu.entryconfigure('Import...', state=tk.NORMAL)
         self.update_UI()
         if (
             self.glob_check.get() and self.global_settings != self.default_settings
@@ -579,7 +610,7 @@ class GUI:
         if len(self.photos) == 0:
             return
 
-        photo_index = self.photoCombo.current()
+        photo_index = 0 if self.lightroom_edit_in else self.photoCombo.current()
         self.current_photo = self.photos[photo_index]
         self.glob_check.set(self.current_photo.use_global_settings)
         if self.current_photo.use_global_settings:
@@ -615,16 +646,12 @@ class GUI:
             self.master.after_idle(check_if_done, t)
         if len(self.photos) == 0:
             return
-        try:
-            if self.current_photo.get_IMG() is None:
-                raise Exception
-        except Exception as e:
-            logger.exception(f'Exception: {e}')
-            print(e)
+
+        if self.current_photo.get_preview_img() is None:
             self.outputFrame.grid_forget()
             self.read_error_lbl.grid(row=0, column=1, sticky='EW') # displays error message when image cannot be loaded
             return
-        
+
         self.read_error_lbl.grid_forget()
         self.outputFrame.grid(row=0, column=1, sticky='NSEW')
         if self.photo_process_Combo.current() == 4: # if "Full Preview" is selected
@@ -632,12 +659,12 @@ class GUI:
             self.photo_display_height = max(int(self.master.winfo_height() - 100), 100) # resize image to full display height
         else:
             self.photo_display_height = max(int((self.master.winfo_height() - 100) / 2), 100)
-            process_photo = ImageTk.PhotoImage(self.resize_IMG(self.current_photo.get_IMG(self.photo_process_values[self.photo_process_Combo.current()])))
+            process_photo = ImageTk.PhotoImage(self.resize_IMG(self.current_photo.get_preview_img(self.photo_process_values[self.photo_process_Combo.current()])))
             self.process_photo.configure(image=[process_photo])
             self.process_photo.image = process_photo
             self.process_photo_frame.grid(row=1, column=0)
 
-        result_photo = ImageTk.PhotoImage(self.resize_IMG(self.current_photo.get_IMG()))
+        result_photo = ImageTk.PhotoImage(self.resize_IMG(self.current_photo.get_preview_img()))
         self.result_photo.configure(image=[result_photo])
         self.result_photo.image = result_photo
         self.master.update()
@@ -1006,13 +1033,16 @@ class GUI:
 
     def export(self, n_photos=1):
         # Start export in seperate thread to keep UI responsive
+        if self.lightroom_edit_in:
+            n_photos = 1
         if len([photo for photo in self.photos if not photo.reject]) == 0:
             return
-        if not self.destination_folder:
-            self.destination_folder = "export"  # sets default export folder
-        if not os.path.exists(self.destination_folder):
-            os.makedirs(self.destination_folder)
-            logger.info(f'Creating {self.destination_folder} folder')
+        if not self.lightroom_edit_in:
+            if not self.destination_folder:
+                self.destination_folder = "export"  # sets default export folder
+            if not os.path.exists(self.destination_folder):
+                os.makedirs(self.destination_folder)
+                logger.info(f'Creating {self.destination_folder} folder')
         
         if n_photos == 1:
             export_fn = self.export_individual
@@ -1030,20 +1060,26 @@ class GUI:
         self.show_progress() # display progress bar
 
         self.current_photo_button.configure(state=tk.DISABLED)
-        self.all_photo_button.configure(state=tk.DISABLED)
-        self.import_button.configure(state=tk.DISABLED)
-        self.filemenu.entryconfigure('Import...', state=tk.DISABLED)
+        if not self.lightroom_edit_in:
+            self.all_photo_button.configure(state=tk.DISABLED)
+            self.import_button.configure(state=tk.DISABLED)
+            self.filemenu.entryconfigure('Import...', state=tk.DISABLED)
         
         self.update_progress(20, 'Processing...') # Arbitrary progress display
         self.current_photo.load(True)
         self.current_photo.process(True)
-        self.update_progress(99, 'Exporting photo...')
-        filename = os.path.join(self.destination_folder, os.path.splitext(str(self.current_photo))[0]) # removes the file extension
-        self.current_photo.export(filename) # saves the photo
+        self.update_progress(99, 'Saving photo...' if self.lightroom_edit_in else 'Exporting photo...')
+        if self.lightroom_edit_in:
+            filename = self.lightroom_path
+        else:
+            filename = os.path.join(self.destination_folder, os.path.splitext(str(self.current_photo))[0]) # removes the file extension
+        
+        self.current_photo.export(filename)
         self.current_photo_button.configure(state=tk.NORMAL)
-        self.all_photo_button.configure(state=tk.NORMAL)
-        self.import_button.configure(state=tk.NORMAL)
-        self.filemenu.entryconfigure('Import...', state=tk.NORMAL)
+        if not self.lightroom_edit_in:
+            self.all_photo_button.configure(state=tk.NORMAL)
+            self.import_button.configure(state=tk.NORMAL)
+            self.filemenu.entryconfigure('Import...', state=tk.NORMAL)
         self.hide_progress() # hide the progress bar
     
     def export_multiple(self):
