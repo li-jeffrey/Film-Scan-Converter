@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+# Needed so semantic-release can push version bump commits and tags,
+# and so the build job can upload assets to the GitHub Release.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  # ── 1. Determine whether a release is warranted ──────────────────────────
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
+      release_id: ${{ steps.release.outputs.release_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history is required so semantic-release can inspect all
+          # commits since the last tag to decide the next version.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reads every commit since the last tag, applies Conventional Commits
+      # rules to decide the next version (or skips if nothing warrants a bump),
+      # writes the new version into pyproject.toml + source/_version.py,
+      # pushes a version-bump commit + tag, and creates a draft GitHub Release.
+      - name: Run semantic-release
+        id: release
+        uses: python-semantic-release/python-semantic-release@v9
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 2. Build the Windows executable (only when a release was made) ────────
+  build-windows:
+    name: Build Windows Executable
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Check out the exact tagged commit that semantic-release just created.
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Cache the pip download cache across runs — skips re-downloading
+          # packages when requirements.txt hasn't changed.
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable with PyInstaller
+        working-directory: source
+        run: >
+          pyinstaller
+          --onefile
+          --windowed
+          --name "Film-Scan-Converter"
+          --icon "assets/camera-roll.ico"
+          --add-data "assets;assets"
+          "Film Scan Converter.pyw"
+
+      # Upload the .exe directly to the GitHub Release that semantic-release created.
+      - name: Upload exe to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >
+          gh release upload ${{ needs.release.outputs.tag }}
+          "source/dist/Film-Scan-Converter.exe"
+          --clobber

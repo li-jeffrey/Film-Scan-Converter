@@ -1,0 +1,38 @@
+[project]
+name = "film-scan-converter"
+version = "0.1.0"
+description = "Convert negative film scans to positive images"
+requires-python = ">=3.11"
+
+[tool.semantic_release]
+# Where to write the bumped version number
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["source/_version.py:__version__"]
+
+branch = "main"
+tag_format = "v{version}"
+
+# Commit message used when semantic-release bumps the version.
+# [skip ci] prevents an infinite loop of triggered workflows.
+commit_message = "chore(release): v{version} [skip ci]"
+
+[tool.semantic_release.remote]
+type = "github"
+
+[tool.semantic_release.commit_parser_options]
+# Commits that trigger a minor (0.x.0) bump
+minor_tags = ["feat"]
+# Commits that trigger a patch (0.0.x) bump
+patch_tags = ["fix", "perf", "refactor"]
+
+[tool.semantic_release.changelog]
+# Keep the changelog tidy by excluding noisy commit types
+exclude_commit_patterns = [
+    "^chore\\(release\\):",
+    "^Merge (branch|pull request)",
+    "^chore:",
+    "^docs:",
+    "^style:",
+    "^test:",
+    "^ci:",
+]
