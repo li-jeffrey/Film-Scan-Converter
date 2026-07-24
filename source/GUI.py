@@ -327,15 +327,16 @@ class GUI:
         self.filemenu.entryconfigure('Import...', state=tk.DISABLED)
         self.prevButton.pack_forget()
         self.nextButton.pack_forget()
+        self.reject_check.hide()
         self.export_destination_heading.pack_forget()
         self.export_destination_lbl.pack_forget()
         self.select_folder_button.pack_forget()
         self.all_photo_button.pack_forget()
         self.export_filetype_widget.hide()
-        self.current_photo_button.configure(text='Save to Lightroom')
+        self.current_photo_button.configure(text='Save and Return to Lightroom')
 
     def import_lightroom_edit_in(self, path):
-        self.lightroom_filename_lbl.configure(text=os.path.basename(path))
+        self.lightroom_filename_lbl.configure(text=path)
         self.lightroom_filename_lbl.pack(side=tk.LEFT, padx=2, fill='x', expand=True)
         self.import_from_filenames((path,))
 
@@ -1081,6 +1082,8 @@ class GUI:
             self.import_button.configure(state=tk.NORMAL)
             self.filemenu.entryconfigure('Import...', state=tk.NORMAL)
         self.hide_progress() # hide the progress bar
+        if self.lightroom_edit_in:
+            self.master.destroy()
     
     def export_multiple(self):
         # This function exports all photos that are loaded. Uses multiprocessing to parallelize export.
