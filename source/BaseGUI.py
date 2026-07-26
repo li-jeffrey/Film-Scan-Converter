@@ -2,7 +2,6 @@ import os
 from tkinter import ttk,  filedialog, messagebox, colorchooser
 import tkinter as tk
 from PIL import ImageTk
-import rawpy
 import threading
 import numpy as np 
 import cv2
@@ -14,6 +13,7 @@ from abc import ABC, abstractmethod
 from CustomWidgets import ScrollFrame, ScaleEntry, CheckLabel, ComboLabel, MultiEntryLabel
 from RawProcessing import RawProcessing
 from ResourcePaths import resource_path
+from AppPaths import ensure_app_data_directory
 
 #logging
 import logging
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class BaseGUI(ABC):
     def __init__(self, master):
         # Initialize Variables
-        self.config_path = self._check_and_create_conf_folder()
+        self.config_path = ensure_app_data_directory()
         self.photos = []
         self.in_progress = set() # keeps track photos that are in processing when first loading
         self.photo_process_values = ['RAW', 'Threshold', 'Contours', 'Histogram', 'Full Preview']
@@ -262,6 +262,8 @@ class BaseGUI(ABC):
         # Loading advanced parameters from the config file
         try:
             params_dict = np.load(os.path.join(self.config_path,'config.npy'), allow_pickle=True).item()
+        except FileNotFoundError:
+            pass
         except Exception as e:
             logger.exception(f'Exception: {e}')
         else:
@@ -327,20 +329,6 @@ class BaseGUI(ABC):
 
     def _export_photo(self, photo, filename):
         photo.export(filename)
-    
-    def _check_and_create_conf_folder(self) -> str:
-        '''
-        Check if conf folder exists and, if not, it creates it
-
-        Returns: 
-            The folder's path
-        '''
-      
-        folder_path = os.path.join(os.path.expanduser('~'), '.film_scan_converter')
-        if not os.path.exists(folder_path):
-            os.makedirs(folder_path)
-            logger.info(f'Creating {folder_path} folder')
-        return folder_path
 
     def advanced_dialog(self):
         # Pop-up window to contain all the advanced settings that don't fit in the main controls

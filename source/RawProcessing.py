@@ -1,6 +1,7 @@
 import rawpy
 import cv2
 import numpy as np
+import tifffile
 from PIL import Image
 import matplotlib.colors
 import os 
@@ -251,14 +252,18 @@ class RawProcessing:
     def export_lightroom_tiff(self, filename):
         img = self.get_export_img()
         if img.ndim == 2:
-            pil_img = Image.fromarray(img, mode='I;16')
+            output = img
+            photometric = 'minisblack'
         else:
-            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        compression = 'tiff_lzw' if getattr(self, 'tiff_compression_tag', None) == 5 else 'raw'
-        save_kwargs = {'format': 'TIFF', 'compression': compression}
-        if getattr(self, 'tiff_icc_profile', None):
-            save_kwargs['icc_profile'] = self.tiff_icc_profile
-        pil_img.save(filename, **save_kwargs)
+            output = np.ascontiguousarray(img[:, :, ::-1])  # BGR -> RGB
+            photometric = 'rgb'
+        tifffile.imwrite(
+            filename,
+            output,
+            photometric=photometric,
+            compression='deflate',
+            iccprofile=getattr(self, 'tiff_icc_profile', None),
+        )
 
     def save_settings(self):
         # saves the processing parameters to a file
