@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.2.5 (2026-07-26)
+
+### Bug Fixes
+
+- Stuck loop on up down toggle
+  ([`343b62f`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/343b62fe9a080ed916b1dc6258f43b306479313f))
+
+
 ## v0.2.4 (2026-07-26)
 
 ### Bug Fixes
