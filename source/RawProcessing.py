@@ -44,7 +44,7 @@ class RawProcessing:
     advanced_attrs = [key for key in default_parameters.keys() if key not in ('filetype', 'frame', 'fit_aspect_ratio')] # list of keys for advanced settings, except for keys that should not be saved
     processing_parameters = ('dark_threshold','light_threshold','border_crop','flip','rotation','film_type','white_point','black_point','gamma','shadows','highlights','temp','tint','sat','reject','base_detect','base_rgb','remove_dust')
     
-    def __init__(self, file_directory, default_settings, global_settings, config_path, lightroom_edit_in):
+    def __init__(self, file_directory, default_settings, global_settings, config_path):
         # file_directory: the name of the RAW file to be processed
         # Instance Variables
         self.processed = False # flag for whether the image has been processed yet
@@ -56,7 +56,6 @@ class RawProcessing:
         self.filename = os.path.basename(self.file_directory)
         self.colour_desc = None # RAW bayer colour description
         self.config_path = config_path
-        self.lightroom_edit_in = lightroom_edit_in
         # initializing raw processing parameters
         try: # to read in the parameters from a saved file
             directory = os.path.join(self.config_path, f"{self.filename.split('.')[0]}.npy")
@@ -81,10 +80,6 @@ class RawProcessing:
             self.use_global_settings = False # tells GUI class whether to overwrite current photo settings with global setting
     
     def load(self, full_res=False):
-        # Loads the RAW file into memory
-        if self.lightroom_edit_in:
-            self._load_lightroom_tiff()
-            return
         try:
             with rawpy.imread(self.file_directory) as raw: # tries to read as raw file
                 self.RAW_IMG = raw.postprocess(
@@ -129,7 +124,7 @@ class RawProcessing:
         self.FileReadError = False
         self.memory_alloc = self.RAW_IMG.nbytes * 4 * 12 # estimation of memory requirements based on the size of the image
 
-    def _load_lightroom_tiff(self):
+    def load_lightroom_tiff(self):
         # 16-bit TIFF from Lightroom (uncompressed or LZW; ProPhoto RGB / Display P3 ICC)
         try:
             with Image.open(self.file_directory) as pil_img:
@@ -244,9 +239,6 @@ class RawProcessing:
         if not hasattr(self, 'IMG'):
             return
         img = self.get_export_img()
-        if self.lightroom_edit_in:
-            self._export_lightroom_tiff(filename, img)
-            return
         filename = f"{filename}.{self.class_parameters['filetype']}"
         match self.class_parameters['filetype']:
             case 'JPG':
@@ -258,7 +250,8 @@ class RawProcessing:
             case _:
                 cv2.imwrite(filename, img)
 
-    def _export_lightroom_tiff(self, path, img):
+    def export_lightroom_tiff(self, filename):
+        img = self.get_export_img()
         if img.ndim == 2:
             pil_img = Image.fromarray(img, mode='I;16')
         else:
@@ -267,7 +260,7 @@ class RawProcessing:
         save_kwargs = {'format': 'TIFF', 'compression': compression}
         if getattr(self, 'tiff_icc_profile', None):
             save_kwargs['icc_profile'] = self.tiff_icc_profile
-        pil_img.save(path, **save_kwargs)
+        pil_img.save(filename, **save_kwargs)
 
     def save_settings(self):
         # saves the processing parameters to a file

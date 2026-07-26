@@ -8,6 +8,8 @@ import argparse
 
 #Custom classes
 from GUI import GUI
+from LightroomEditInUI import LightroomEditInUI
+from ResourcePaths import resource_path
 
 
 def getopts():
@@ -46,20 +48,8 @@ if __name__ == '__main__':
     multiprocessing.freeze_support()
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
-
-        def resource_path(relative_path):    
-            try:       
-                base_path = sys._MEIPASS
-                return os.path.join(base_path, icon)
-            except Exception:
-                base_path = os.path.abspath('.')
-                return os.path.join(base_path, relative_path)
-
         icon = 'camera-roll.ico'
-        if not hasattr(sys, 'frozen'):
-            datafile = os.path.join(os.path.dirname(__file__), 'assets', icon)
-        else:
-            datafile = os.path.join(sys.prefix, 'assets', icon)
+        datafile = os.path.join('assets', icon)
     except Exception as e:
         logger.exception(f'Exception: {e}')
         root = tk.Tk()
@@ -67,9 +57,10 @@ if __name__ == '__main__':
         root = tk.Tk()
         root.iconbitmap(default=resource_path(datafile))
 
-    window = GUI(root, lightroom_path=lightroom_path)
-
-    if lightroom_path is not None:
+    if lightroom_path is None:
+        window = GUI(root)
+    else:
+        window = LightroomEditInUI(root, lightroom_path)
         root.after(0, window.resize_UI)
         root.after(0, window.import_lightroom_edit_in, lightroom_path)
 
