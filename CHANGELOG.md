@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v0.2.4 (2026-07-26)
+
+### Bug Fixes
+
+- Lightroom edit in logging path error
+  ([`3c381cc`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/3c381cc376deeaefb62d4cf237bdf2f522eb6c0d))
+
+- Split out lightroom app for different handling
+  ([`1de0755`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/1de07553cff7d5cd608b9f82a71ebabec91b89bf))
+
+- Use tifffile for saving lightroom edit in tiff
+  ([`ba99f52`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/ba99f520de44c2447e65a26e5fe6ef81bef3b97d))
+
+### Refactoring
+
+- Split out build and install scripts
+  ([`cafb966`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/cafb9667c3e93814af68ea188cb8ecb7c0c9a941))
+
+
 ## v0.2.3 (2026-07-26)
 
 ### Bug Fixes
