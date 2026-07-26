@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.2.3 (2026-07-26)
+
+### Bug Fixes
+
+- Startup path loading error
+  ([`1f1b451`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/1f1b45128eca5fbcbaa16a20ddc1642cf16217c4))
+
+
 ## v0.2.2 (2026-07-26)
 
 ### Refactoring
