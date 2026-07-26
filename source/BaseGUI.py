@@ -19,8 +19,6 @@ from ResourcePaths import resource_path
 import logging
 
 logger = logging.getLogger(__name__)
-FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
-logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 
 class BaseGUI(ABC):
     def __init__(self, master):

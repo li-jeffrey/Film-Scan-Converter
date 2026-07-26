@@ -6,7 +6,12 @@ import sys
 import logging
 import argparse
 
-#Custom classes
+from AppLogging import configure_logging
+
+
+configure_logging()
+
+# Custom classes
 from GUI import GUI
 from LightroomEditInUI import LightroomEditInUI
 from ResourcePaths import resource_path
@@ -38,8 +43,6 @@ def resolve_lightroom_path(image_path):
 
 
 logger = logging.getLogger(__name__)
-FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
-logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 opts = getopts()
 lightroom_path = resolve_lightroom_path(opts.image_path)
 

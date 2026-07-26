@@ -8,8 +8,6 @@ import os
 import logging
 
 logger = logging.getLogger(__name__)
-FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
-logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 
 class RawProcessing:
     # This class defines a photo object that contains the image processing pipeline from raw to final export, including all processing functions and parameters

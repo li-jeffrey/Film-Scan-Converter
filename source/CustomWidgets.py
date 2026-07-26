@@ -5,8 +5,6 @@ import logging
 from typing import Callable, Iterable
 
 logger = logging.getLogger(__name__)
-FORMAT = '%(asctime)s:::%(levelname)s:::%(message)s'
-logging.basicConfig(filename='logfile.log', level=logging.DEBUG, format=FORMAT)
 
 class AutoScrollbar(ttk.Scrollbar):
    # A scrollbar that hides itself if it's not needed.
