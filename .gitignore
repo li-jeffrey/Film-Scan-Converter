@@ -5,3 +5,8 @@ __pycache__
 *.npy
 .data
 source/export/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec

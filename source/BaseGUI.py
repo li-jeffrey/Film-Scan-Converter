@@ -1,5 +1,4 @@
 import os
-import sys
 from tkinter import ttk,  filedialog, messagebox, colorchooser
 import tkinter as tk
 from PIL import ImageTk
@@ -9,12 +8,12 @@ import numpy as np
 import cv2
 import multiprocessing
 from typing import Literal
-from os.path import dirname
 from abc import ABC, abstractmethod
 
 #custom classes
 from CustomWidgets import ScrollFrame, ScaleEntry, CheckLabel, ComboLabel, MultiEntryLabel
 from RawProcessing import RawProcessing
+from ResourcePaths import resource_path
 
 #logging
 import logging
@@ -156,10 +155,9 @@ class BaseGUI(ABC):
         self.set_tooltip(rotButtons.winfo_children()[-1], "(R)")
 
         # Colour settings
-        if getattr(sys, 'frozen', False):
-            picker = tk.PhotoImage(file=os.path.join(sys._MEIPASS, 'dropper.png')).subsample(15,15)
-        else:
-            picker = tk.PhotoImage(file=os.path.join(dirname(__file__), 'assets/dropper.png')).subsample(15,15)
+        picker = tk.PhotoImage(
+            file=resource_path(os.path.join('assets', 'dropper.png'))
+        ).subsample(15,15)
         colour_title = ttk.Label(text='Colour Adjustment', font=self.header_style, padding=2)
         self.colourFrame = ttk.LabelFrame(dynamic_scroll_frame.frame, borderwidth=2, labelwidget=colour_title, padding=5)
         colour_controls = ttk.Frame(self.colourFrame)
