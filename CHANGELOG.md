@@ -1,6 +1,14 @@
 # CHANGELOG
 
 
+## v0.2.2 (2026-07-26)
+
+### Refactoring
+
+- Extract LightroomEditIn logic into its own class
+  ([`67f7dda`](https://github.com/li-jeffrey/Film-Scan-Converter/commit/67f7dda122b01fdc244da856795bfc150bf0ca0f))
+
+
 ## v0.2.1 (2026-07-26)
 
 ### Bug Fixes
