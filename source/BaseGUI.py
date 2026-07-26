@@ -606,7 +606,7 @@ class BaseGUI(ABC):
         result_photo = ImageTk.PhotoImage(self.resize_IMG(self.current_photo.get_preview_img()))
         self.result_photo.configure(image=[result_photo])
         self.result_photo.image = result_photo
-        self.master.update()
+        self.master.update_idletasks()
 
         if full_res:
             # Generates full resolution image in the background

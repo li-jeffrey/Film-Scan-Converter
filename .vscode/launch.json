@@ -2,19 +2,19 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Film Scan Converter",
+      "name": "App",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/source/Film Scan Converter.pyw",
+      "program": "${workspaceFolder}/source/App.pyw",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "justMyCode": true
     },
     {
-      "name": "Film Scan Converter (Lightroom Edit In)",
+      "name": "Lightroom App",
       "type": "debugpy",
       "request": "launch",
-      "program": "${workspaceFolder}/source/Film Scan Converter.pyw",
+      "program": "${workspaceFolder}/source/LightroomApp.pyw",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
       "args": ["${input:editInImagePath}"],
