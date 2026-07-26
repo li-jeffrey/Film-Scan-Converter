@@ -1,6 +1,8 @@
 # Film Scan Converter
 
-A standalone application used for processing RAW film scans from a digital camera into final images  
+This fork is a significant refactor of the original Film Scan Converter. Its goal is to make the program easy to use with Adobe Lightroom.
+
+A standalone application used for processing RAW film scans from a digital camera into final images.  
 ![image](./docs/images/ed4f2e61-0fa0-404f-bdea-c34ea1925662.png)
 
 ## Installation
@@ -18,9 +20,14 @@ Quick Links:
 
 Developer documentation and contribution guidelines are available in the [docs/developer-guide.md](docs/development/index.md) file.
 
-## ART Integration
+## Using with Lightroom
 
-Film scan converter can be integrated into [Art Raw Editor](https://artraweditor.github.io) to provide quick and convenient access to opening full folders, individuals files and multiple selected files. The documentation on how to install art and how to use the integration is located in [docs/how-to-add-to-ART.md](docs/how-to-add-to-ART.md).
+The easiest way to use Film Scan Converter with Lightroom is:
+
+1. Download `Film-Scan-Converter-Lightroom.exe` from the [GitHub Releases](../../releases) page.
+2. Save the downloaded executable in a folder where you want to keep it.
+3. In Lightroom, right-click any photo and select **Edit In**.
+4. Select **Browse**, then choose the downloaded `Film-Scan-Converter-Lightroom.exe`.
 
 ## Contributing
 

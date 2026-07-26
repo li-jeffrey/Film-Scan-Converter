@@ -1,4 +1,0 @@
-[ART UserCommand]
-Label=Film Scan Converter
-Command=./film_scan_converter_directory.sh
-FileType=directory
