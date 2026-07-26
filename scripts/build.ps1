@@ -3,7 +3,6 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $sourceDirectory = Join-Path $repoRoot 'source'
 $python = Join-Path $repoRoot '.venv\Scripts\python.exe'
-$installDirectory = Join-Path $env:LOCALAPPDATA 'Film Scan Converter'
 $builds = @(
     @{
         EntryPoint = 'App.pyw'
@@ -40,21 +39,13 @@ finally {
     Pop-Location
 }
 
-New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
-
 foreach ($build in $builds) {
     $exeName = "$($build.Name).exe"
     $builtExe = Join-Path $sourceDirectory "dist\$exeName"
-    $installedExe = Join-Path $installDirectory $exeName
 
     if (-not (Test-Path $builtExe)) {
         throw "Build completed without producing: $builtExe"
     }
 
-    Copy-Item -Path $builtExe -Destination $installedExe -Force
-    if (-not (Test-Path $installedExe)) {
-        throw "Failed to copy executable to: $installedExe"
-    }
-
-    Write-Host "Built and installed: $installedExe"
+    Write-Host "Built: $builtExe"
 }
