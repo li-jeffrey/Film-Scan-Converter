@@ -39,9 +39,9 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── 2. Build the Windows executable (only when a release was made) ────────
+  # ── 2. Build the Windows executables (only when a release was made) ───────
   build-windows:
-    name: Build Windows Executable
+    name: Build Windows Executables
     needs: release
     if: needs.release.outputs.released == 'true'
     runs-on: windows-latest
@@ -65,22 +65,26 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build executable with PyInstaller
+      - name: Build executables with PyInstaller
         working-directory: source
-        run: >
-          pyinstaller
-          --onefile
-          --windowed
-          --name "Film-Scan-Converter"
-          --icon "assets/camera-roll.ico"
-          --add-data "assets;assets"
-          "Film Scan Converter.pyw"
+        run: |
+          pyinstaller --onefile --windowed `
+            --name "Film-Scan-Converter" `
+            --icon "assets/camera-roll.ico" `
+            --add-data "assets;assets" `
+            "App.pyw"
+          pyinstaller --onefile --windowed `
+            --name "Film-Scan-Converter-Lightroom" `
+            --icon "assets/camera-roll.ico" `
+            --add-data "assets;assets" `
+            "LightroomApp.pyw"
 
-      # Upload the .exe directly to the GitHub Release that semantic-release created.
-      - name: Upload exe to GitHub Release
+      # Upload both .exe files to the GitHub Release that semantic-release created.
+      - name: Upload executables to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          gh release upload ${{ needs.release.outputs.tag }}
-          "source/dist/Film-Scan-Converter.exe"
-          --clobber
+        run: |
+          gh release upload ${{ needs.release.outputs.tag }} `
+            "source/dist/Film-Scan-Converter.exe" `
+            "source/dist/Film-Scan-Converter-Lightroom.exe" `
+            --clobber
