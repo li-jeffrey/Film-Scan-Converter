@@ -338,7 +338,7 @@ class GUI(BaseGUI):
                     raise Exception('File could not be read')
                 if terminate.is_set():
                     return
-                photo.process(True)
+                photo.process(True, for_export=True)
             except Exception as exception:
                 error = exception
             else:

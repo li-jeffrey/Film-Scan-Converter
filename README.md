@@ -5,6 +5,10 @@ This fork is a significant refactor of the original Film Scan Converter. Its goa
 A standalone application used for processing RAW film scans from a digital camera into final images.  
 ![image](./docs/images/ed4f2e61-0fa0-404f-bdea-c34ea1925662.png)
 
+## Credits
+
+The negative conversion engine is ported from [NegPy](https://github.com/marcinz606/negpy) (GPL-3.0). See [NOTICE.md](NOTICE.md).
+
 ## Installation
 
 For installing Film-Scan-Converter please check the [installation](docs/installation.md) chapter in the documentation.

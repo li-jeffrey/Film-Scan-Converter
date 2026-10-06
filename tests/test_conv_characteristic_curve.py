@@ -1,0 +1,217 @@
+"""Contract tests for the asymmetric H&D print curve (toe-linear-shoulder).
+
+These pin the *new* curve semantics independent of the exact calibrated
+constants: monotone, asymptotes to paper white / paper black, and the toe and
+shoulder sliders act on independent ends (highlights vs shadows).
+"""
+
+import unittest
+
+import numpy as np
+
+from conversion.print_curve import (
+    apply_characteristic_curve,
+    compute_pivot,
+    grade_to_slope,
+    slope_to_grade,
+)
+from conversion.constants import EXPOSURE_CONSTANTS
+from tests._oetf import working_oetf_decode, working_oetf_encode
+
+
+def _ramp(n=257):
+    x = np.linspace(0.0, 1.0, n).astype(np.float32)
+    return x, np.stack([x, x, x], axis=-1)[None, :, :]
+
+
+def _curve(
+    toe=0.0,
+    shoulder=0.0,
+    grade=115.0,
+    density=1.0,
+    lum_range=1.3,
+    shadow_density=0.0,
+    highlight_density=0.0,
+    shadow_grade=0.0,
+    highlight_grade=0.0,
+):
+    x, ramp = _ramp()
+    d_min = EXPOSURE_CONSTANTS["d_min"]
+    slope = grade_to_slope(grade, lum_range)
+    pivot = compute_pivot(slope, density=density, d_min=d_min)
+    out = apply_characteristic_curve(
+        ramp,
+        (pivot, slope),
+        (pivot, slope),
+        (pivot, slope),
+        toe=toe,
+        shoulder=shoulder,
+        shadow_density=shadow_density,
+        highlight_density=highlight_density,
+        d_min=d_min,
+    )
+    # Stage outputs linear; compare in the displayed space where goldens are calibrated.
+    return x, np.asarray(working_oetf_encode(np.asarray(out)))[0, :, 0].astype(np.float64)
+
+
+def _output_to_density(s):
+    # Decode the displayed curve value (working TRC) back to transmittance, then density.
+    t = np.asarray(working_oetf_decode(np.asarray(s, dtype=np.float32)))
+    return -np.log10(np.clip(t, 1e-12, None))
+
+
+class TestCurveShape(unittest.TestCase):
+    def test_monotone_decreasing(self):
+        """Print brightness decreases monotonically with input (highlights->shadows)."""
+        for grade in (50.0, 115.0, 180.0):
+            _, out = _curve(grade=grade)
+            self.assertTrue(np.all(np.diff(out) <= 1e-6), f"non-monotone at grade {grade}")
+
+    def test_endpoints_reach_paper_white_and_black(self):
+        """x->0 prints near paper white (D~d_min); x->1 near paper black (D~d_max)."""
+        _, out = _curve()
+        d = _output_to_density(out)
+        self.assertLess(abs(d[0] - EXPOSURE_CONSTANTS["d_min"]), 0.25, "highlight not near paper white")
+        self.assertLess(abs(d[-1] - EXPOSURE_CONSTANTS["d_max"]), 0.4, "shadow not near paper black")
+
+
+class TestToeShoulderIndependence(unittest.TestCase):
+    """The defining new behaviour: toe shapes ONLY shadows, shoulder ONLY highlights
+    (film/print convention)."""
+
+    def test_toe_acts_on_shadows_not_highlights(self):
+        x, base = _curve()
+        _, toed = _curve(toe=1.0)
+        hi = x < 0.2  # highlights (paper-white end)
+        sh = x > 0.8  # shadows (paper-black end)
+        self.assertGreater(np.max(np.abs(toed[sh] - base[sh])), 0.02, "toe did not affect shadows")
+        np.testing.assert_allclose(toed[hi], base[hi], atol=0.01, err_msg="toe leaked into highlights")
+
+    def test_shoulder_acts_on_highlights_not_shadows(self):
+        x, base = _curve()
+        _, sh_out = _curve(shoulder=1.0)
+        hi = x < 0.2
+        sh = x > 0.8
+        self.assertGreater(np.max(np.abs(sh_out[hi] - base[hi])), 0.02, "shoulder did not affect highlights")
+        np.testing.assert_allclose(sh_out[sh], base[sh], atol=0.01, err_msg="shoulder leaked into shadows")
+
+    def test_toe_positive_lifts_shadows(self):
+        x, base = _curve()
+        _, toed = _curve(toe=1.0)
+        sh = x > 0.85
+        self.assertGreater(float(np.mean(toed[sh])), float(np.mean(base[sh])))
+
+    def test_shoulder_positive_darkens_highlights(self):
+        x, base = _curve()
+        _, sh_out = _curve(shoulder=1.0)
+        hi = x < 0.15
+        self.assertLess(float(np.mean(sh_out[hi])), float(np.mean(base[hi])))
+
+
+class TestCalibration(unittest.TestCase):
+    def test_default_curve_shape(self):
+        """Pin the default tone reproduction so edits don't drift. Golden is the
+        displayed curve in the working-space TRC (Adobe RGB gamma) at x = 0, .25,
+        .5, .75, 1."""
+        x, out = _curve()
+        idx = [0, 64, 128, 192, 256]
+        golden = [0.922, 0.783, 0.4, 0.168, 0.098]
+        for i, g in zip(idx, golden):
+            self.assertAlmostEqual(out[i], g, delta=0.03, msg=f"x={x[i]:.2f}")
+
+    def test_full_toe_lift_strength(self):
+        """Pin the toe strength: toe=1 lands paper black at
+        d_max − strength·toe_height ≈ 1.54 (a clearly faded black)."""
+        _, out = _curve(toe=1.0)
+        d = _output_to_density(out)
+        ts = EXPOSURE_CONSTANTS["toe_shoulder_strength"]
+        expected = EXPOSURE_CONSTANTS["d_max"] - ts * EXPOSURE_CONSTANTS["toe_height"]
+        self.assertAlmostEqual(float(d[-1]), expected, delta=0.1)
+        self.assertLess(expected, 1.7, "full toe throw should land well below paper black")
+
+
+class TestZoneDensity(unittest.TestCase):
+    """Neutral zone density offsets (ΔD): mid-sparing shadow/highlight brightness
+    sliders, bounded by paper black/white."""
+
+    def _zone(self, sd=0.0, hd=0.0):
+        return _curve(shadow_density=sd, highlight_density=hd)
+
+    def test_shadow_lift_acts_on_shadows_spares_mids(self):
+        x, base = _curve()
+        _, out = self._zone(sd=-0.9)
+        sh = x > 0.8
+        hi = x < 0.2
+        mid = (x > 0.35) & (x < 0.55)
+        d_sh = float(np.max(np.abs(out[sh] - base[sh])))
+        d_hi = float(np.max(np.abs(out[hi] - base[hi])))
+        d_mid = float(np.max(np.abs(out[mid] - base[mid])))
+        self.assertGreater(d_sh, 0.1, "full shadow lift too weak")
+        self.assertGreater(d_sh, 10.0 * d_hi, "shadow slider leaked into highlights")
+        self.assertGreater(d_sh, 3.0 * d_mid, "shadow slider not mid-sparing")
+        self.assertGreater(float(np.mean(out[sh])), float(np.mean(base[sh])), "negative ΔD must lift")
+
+    def test_highlight_burn_acts_on_highlights_spares_shadows(self):
+        x, base = _curve()
+        _, out = self._zone(hd=0.5)
+        sh = x > 0.8
+        hi = x < 0.3
+        d_sh = float(np.max(np.abs(out[sh] - base[sh])))
+        d_hi = float(np.max(np.abs(out[hi] - base[hi])))
+        self.assertGreater(d_hi, 0.1, "full highlight burn too weak")
+        self.assertGreater(d_hi, 20.0 * d_sh, "highlight slider not highlight-local")
+        self.assertLess(float(np.mean(out[hi])), float(np.mean(base[hi])), "positive ΔD must darken")
+
+    def test_bounded_by_paper_limits(self):
+        """Offsets are applied before the softplus bounds: a shadow burn cannot
+        exceed paper black, a highlight bleach cannot exceed paper white."""
+        x, base = _curve()
+        for sd, hd in ((0.9, 0.0), (0.0, -0.5)):
+            _, out = self._zone(sd=sd, hd=hd)
+            d = _output_to_density(out)
+            self.assertLessEqual(float(np.max(d)), EXPOSURE_CONSTANTS["d_max"] + 1e-6)
+            self.assertGreaterEqual(float(np.min(d)), 0.0)
+            self.assertTrue(np.all(np.diff(out) <= 1e-6), "zone offset broke monotonicity")
+
+    def test_chart_mirror_parity(self):
+        """CharacteristicCurve must draw the same zone shift the kernel renders."""
+        from conversion.print_curve import CharacteristicCurve
+        from tests._oetf import working_oetf_encode
+
+        d_min = EXPOSURE_CONSTANTS["d_min"]
+        slope = grade_to_slope(115.0, 1.3)
+        pivot = compute_pivot(slope, density=1.0, d_min=d_min)
+        for sd, hd in ((0.5, -0.2), (-0.9, 0.3)):
+            x, kernel = self._zone(sd=sd, hd=hd)
+            cc = CharacteristicCurve(contrast=slope, pivot=pivot, d_min=d_min, shadow_density=sd, highlight_density=hd)
+            d = cc(x.astype(np.float32))
+            enc = np.asarray(working_oetf_encode(np.power(10.0, -np.asarray(d)).astype(np.float32))).reshape(-1)
+            np.testing.assert_allclose(enc, kernel, atol=1e-4, err_msg=f"sd={sd} hd={hd}")
+
+
+
+
+class TestPivotAndGrade(unittest.TestCase):
+    def test_reference_prints_at_target_grade_invariant(self):
+        """Reference tone lands on anchor_target_density for any grade (rotation center)."""
+        d_min = EXPOSURE_CONSTANTS["d_min"]
+        x_ref = EXPOSURE_CONSTANTS["assumed_anchor"]
+        target = EXPOSURE_CONSTANTS["anchor_target_density"]
+        ref_img = np.full((4, 4, 3), x_ref, dtype=np.float32)
+        for grade in (60.0, 115.0, 170.0):
+            slope = grade_to_slope(grade, 1.3)
+            pivot = compute_pivot(slope, density=1.0, d_min=d_min)
+            out = working_oetf_encode(
+                np.asarray(apply_characteristic_curve(ref_img, (pivot, slope), (pivot, slope), (pivot, slope), d_min=d_min))
+            )
+            d_out = float(_output_to_density(float(out[0, 0, 0])))
+            self.assertAlmostEqual(d_out, target, places=3, msg=f"grade={grade}")
+
+    def test_grade_slope_roundtrip(self):
+        for grade in (50.0, 90.0, 115.0, 150.0, 180.0):
+            r = 1.4
+            self.assertAlmostEqual(slope_to_grade(grade_to_slope(grade, r), r), grade, places=2)
+
+
+if __name__ == "__main__":
+    unittest.main()

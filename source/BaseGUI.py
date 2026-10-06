@@ -12,6 +12,11 @@ from abc import ABC, abstractmethod
 #custom classes
 from CustomWidgets import ScrollFrame, ScaleEntry, CheckLabel, ComboLabel, MultiEntryLabel
 from RawProcessing import RawProcessing
+from conversion import crosstalk as xt_profiles
+from conversion.modes import ProcessMode
+from conversion.papers import profiles_for_mode
+from conversion.params import SPEC_DEFAULTS, mode_defaults
+from conversion.print_curve import kelvin_to_wb, wb_to_kelvin
 from ResourcePaths import resource_path
 from AppPaths import ensure_app_data_directory
 
@@ -19,6 +24,8 @@ from AppPaths import ensure_app_data_directory
 import logging
 
 logger = logging.getLogger(__name__)
+
+CONFIG_VERSION = 2
 
 class BaseGUI(ABC):
     def __init__(self, master):
@@ -50,17 +57,10 @@ class BaseGUI(ABC):
             light_threshold = 100,
             border_crop = 1,
             flip = False,
-            white_point = 0,
-            black_point = 0,
-            gamma = 0,
-            shadows = 0,
-            highlights = 0,
-            temp = 0,
-            tint = 0,
-            sat = 100,
             base_detect = 0,
-            base_rgb = (255, 255, 255),
-            remove_dust = False
+            base_rgb = None, # linear film base picked from the scan, None = Auto
+            remove_dust = False,
+            **SPEC_DEFAULTS
         )
 
         self.global_settings = self.default_settings.copy()
@@ -127,7 +127,7 @@ class BaseGUI(ABC):
         self.filmFrame = ttk.Frame(processingFrame)
         self.filmFrame.grid(row=3, column=0, sticky='EW')
         film_types = ['Black & White Negative', 'Colour Negative', 'Slide (Colour Positive)','Crop Only (RAW)']
-        self.film_type = ComboLabel(self.filmFrame, 'Film Type:', 0, film_types, 'film_type', self.widgets, width=25, command=self.widget_changed)
+        self.film_type = ComboLabel(self.filmFrame, 'Film Type:', 0, film_types, 'film_type', self.widgets, width=25, command=self.film_type_changed)
         # Dust removal
         self.dustFrame = ttk.Frame(processingFrame)
         self.dustFrame.grid(row=4, column=0, sticky='EW')
@@ -164,35 +164,64 @@ class BaseGUI(ABC):
         self.base_mode = ComboLabel(colour_controls, 'Film Base Colour', 0, base_setting_modes, 'base_detect', self.widgets, command=self.set_base_detect)
         self.base_clr_lbl = ttk.Label(colour_controls, text='RGB:')
         self.base_rgb = tk.StringVar()
-        self.base_rgb.set(str(self.global_settings['base_rgb']))
         self.base_rgb_lbl = ttk.Label(colour_controls, textvariable=self.base_rgb)
-        self.rgb_display = tk.Frame(colour_controls, bg=self._from_rgb(self.global_settings['base_rgb']), height=20, width=20, relief=tk.GROOVE, borderwidth=1)
+        self.rgb_display = tk.Frame(colour_controls, bg=self._from_rgb((128, 128, 128)), height=20, width=20, relief=tk.GROOVE, borderwidth=1)
         self.base_pick_button = ttk.Button(colour_controls, image=picker, command=self.set_base)
         self.base_pick_button.image = picker
         self.base_buttons_frame = ttk.Frame(colour_controls)
         ttk.Button(self.base_buttons_frame, text='Set RGB', command=lambda:self.set_base_rgb(0), width=8).pack(side=tk.LEFT, padx=2, pady=2, anchor='center')
         ttk.Button(self.base_buttons_frame, text='Import Blank...', command=lambda:self.set_base_rgb(2), width=13).pack(side=tk.LEFT, padx=2, pady=2, anchor='center')
+        self._set_base_display(self.global_settings.get('base_rgb'))
         ttk.Label(colour_controls, text='White Balance Picker:').grid(row=3, column=0, sticky=tk.E)
         self.wb_picker_button = ttk.Button(colour_controls, image=picker, command=self.pick_wb)
         self.wb_picker_button.grid(row=3, column=1, sticky=tk.W)
         self.wb_picker_button.image = picker
-        self.temp = ScaleEntry(colour_controls, 'Temperature:', 4, -100, 100, 'temp', self.widgets, increment=1, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        self.tint = ScaleEntry(colour_controls, 'Tint:', 5, -100, 100, 'tint', self.widgets, increment=1, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        ScaleEntry(colour_controls, 'Saturation (%):', 6, 0, 200, 'sat', self.widgets, increment=10, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        
+        skip = lambda widget: self.widget_changed(widget, 'skip crop')
+        self.temperature = ScaleEntry(colour_controls, 'Temperature (K):', 4, 3000, 12000, None, None, global_sync=False, increment=100, default_value=5500, command=self.temperature_changed)
+        ScaleEntry(colour_controls, 'Cyan:', 5, -1, 1, 'wb_cyan', self.widgets, is_float=True, increment=0.01, command=skip)
+        ScaleEntry(colour_controls, 'Magenta:', 6, -1, 1, 'wb_magenta', self.widgets, is_float=True, increment=0.01, command=self.filtration_changed)
+        ScaleEntry(colour_controls, 'Yellow:', 7, -1, 1, 'wb_yellow', self.widgets, is_float=True, increment=0.01, command=self.filtration_changed)
+        ScaleEntry(colour_controls, 'Saturation:', 8, 0.5, 1.5, 'dye_separation', self.widgets, is_float=True, increment=0.05, command=skip)
+        ScaleEntry(colour_controls, 'Cast Removal:', 9, 0, 1, 'cast_removal', self.widgets, is_float=True, increment=0.05, command=skip)
+        stocks = xt_profiles.list_profiles()
+        ComboLabel(colour_controls, 'Film Stock:', 10, stocks, 'crosstalk_profile', self.widgets, output_list=stocks, width=25, command=skip)
+        ScaleEntry(colour_controls, 'Crosstalk Strength:', 11, 0, 1, 'crosstalk_strength', self.widgets, is_float=True, increment=0.05, command=skip)
+
         # Brightness Settings
-        brightness_title = ttk.Label(text='Brightness Adjustment', font=self.header_style, padding=2)
+        brightness_title = ttk.Label(text='Print Adjustment', font=self.header_style, padding=2)
         self.exposureFrame = ttk.LabelFrame(dynamic_scroll_frame.frame, borderwidth=2, labelwidget=brightness_title, padding=5)
         self.exposureFrame.grid(row=7, column=0, sticky='EW')
         exposureControls = ttk.Frame(self.exposureFrame)
         exposureControls.pack(fill='x', side=tk.LEFT)
-        exposureControls.grid_rowconfigure(6, weight=1)
         exposureControls.grid_columnconfigure(3, weight=1)
-        ScaleEntry(exposureControls, 'White Point:', 0, -100, 100, 'white_point', self.widgets, increment=5, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        ScaleEntry(exposureControls, 'Black Point:', 1, -100, 100, 'black_point', self.widgets, increment=5, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        ScaleEntry(exposureControls, 'Gamma:', 2, -100, 100, 'gamma', self.widgets, increment=5, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        ScaleEntry(exposureControls, 'Shadows:', 3, -100, 100, 'shadows', self.widgets, increment=5, command=lambda widget:self.widget_changed(widget, 'skip crop'))
-        ScaleEntry(exposureControls, 'Highlights:', 4, -100, 100, 'highlights', self.widgets, increment=5, command=lambda widget:self.widget_changed(widget, 'skip crop'))
+        self._print_row = 0
+        def row():
+            self._print_row += 1
+            return self._print_row - 1
+        def fslider(label, key, lo, hi, step):
+            return ScaleEntry(exposureControls, label, row(), lo, hi, key, self.widgets, is_float=isinstance(step, float), increment=step, command=skip)
+        fslider('Print Density:', 'density', 0.0, 2.0, 0.05)
+        fslider('Grade (ISO R):', 'grade', 50, 180, 1)
+        self.effective_grade_lbl = ttk.Label(exposureControls, text='')
+        self.effective_grade_lbl.grid(row=row(), column=0, columnspan=3, sticky='e')
+        CheckLabel(exposureControls, 'Auto Density:', row(), 'auto_density', self.widgets, command=skip)
+        CheckLabel(exposureControls, 'Auto Grade:', row(), 'auto_grade', self.widgets, command=skip)
+        fslider('Toe:', 'toe', -1.0, 1.0, 0.05)
+        fslider('Toe Width:', 'toe_width', 0.1, 5.0, 0.1)
+        fslider('Shoulder:', 'shoulder', -1.0, 1.0, 0.05)
+        fslider('Shoulder Width:', 'shoulder_width', 0.1, 5.0, 0.1)
+        fslider('Shadows:', 'shadow_density', -0.9, 0.9, 0.01)
+        fslider('Highlights:', 'highlight_density', -0.5, 0.5, 0.01)
+        self.paper_keys = ['neutral']
+        self.paper_combo = ComboLabel(exposureControls, 'Paper:', row(), ['Neutral'], 'paper_profile', self.widgets, output_list=self.paper_keys, width=25, command=skip)
+        CheckLabel(exposureControls, 'Paper White:', row(), 'paper_dmin', self.widgets, command=skip)
+        CheckLabel(exposureControls, 'Paper Black:', row(), 'paper_black', self.widgets, command=skip)
+        fslider('White Point:', 'white_point_offset', -0.25, 0.25, 0.01)
+        fslider('Black Point:', 'black_point_offset', -0.25, 0.25, 0.01)
+        self.clip_widgets = [
+            fslider('Luma Clip:', 'luma_clip_pos', -100, 100, 1),
+            fslider('Colour Clip:', 'color_clip_pos', -100, 100, 1),
+        ]
 
         # Export photo settings
         export_title = ttk.Label(text='Export Settings', font=self.header_style, padding=2)
@@ -267,12 +296,14 @@ class BaseGUI(ABC):
         except Exception as e:
             logger.exception(f'Exception: {e}')
         else:
+            if params_dict.get('config_version', 1) < CONFIG_VERSION:
+                params_dict.pop('ignore_border', None) # v1 meant "EQ ignore border"; the analysis border has a new default
             for settings in [self.advanced_settings, RawProcessing.class_parameters]:
                 for attr in settings:
                     if attr in params_dict:
                         settings[attr] = params_dict[attr] # Initializes every parameter with imported parameters
                     else:
-                        logger.exception(f'Attribute {attr} not found in imported config.npy file.')
+                        logger.info(f'Attribute {attr} not found in imported config.npy file.')
                     
         for widget in self.widgets.values():
             if widget.key in self.default_settings:
@@ -332,13 +363,6 @@ class BaseGUI(ABC):
 
     def advanced_dialog(self):
         # Pop-up window to contain all the advanced settings that don't fit in the main controls
-        def set_wb(event=None):
-            # Hides or shows wb multipliers if using wb from camera
-            if use_camera_wb.get():
-                wb_mult.hide()
-            else:
-                wb_mult.show()
-
         def apply_settings():
             # applies the values stored in the widgets to the rest of the class
             for widget in advanced_widgets.values():
@@ -360,6 +384,7 @@ class BaseGUI(ABC):
                 params_dict[attr] = RawProcessing.class_parameters[attr]
             for attr in self.advanced_settings:
                 params_dict[attr] = self.advanced_settings[attr]
+            params_dict['config_version'] = CONFIG_VERSION
             np.save(f'{os.path.join(self.config_path,"config.npy")}', params_dict)
         
         def quit():
@@ -376,7 +401,6 @@ class BaseGUI(ABC):
             # Resets advanced settings to default values
             set_widgets(RawProcessing.default_parameters)
             set_widgets(self.default_advanced_settings)
-            set_wb()
 
         top = tk.Toplevel(self.master)
         top.transient(self.master)
@@ -413,32 +437,22 @@ class BaseGUI(ABC):
         dm_algs_list = ('LINEAR','VNG','PPG','AHD','DCB','DHT','AAHD')
         ComboLabel(import_settings, 'Demosaicing Algorithm:', 0, dm_algs_list, 'dm_alg', advanced_widgets, output_list=allowable_dm_algs, width=25)
         MultiEntryLabel(import_settings, 'Median Filter Passes:', 1, 0, 10, 1, key='median_filter_passes', widget_dictionary=advanced_widgets, width=25)
-        cs_list = ('raw','sRGB','Adobe','Wide','ProPhoto','XYZ','ACES','P3D65','Rec2020')
-        ComboLabel(import_settings, 'RAW Output Colour Space:', 2, cs_list, 'colour_space', advanced_widgets, width=25)
-        MultiEntryLabel(import_settings, 'RAW Gamma (Power, Slope):', 3, 0, 8, 2, key='raw_gamma', widget_dictionary=advanced_widgets, is_float=True, increment=0.1, width=25)
-        MultiEntryLabel(import_settings, 'RAW Exposure Shift:', 4, -2, 3, 1, key='exp_shift', widget_dictionary=advanced_widgets, is_float=True, increment=0.25, width=25)
+        ComboLabel(import_settings, 'Input Encoding (16-bit, no profile):', 2, ('Auto','sRGB','Linear'), 'input_encoding', advanced_widgets, output_list=('Auto','sRGB','Linear'), width=25)
         fbdd_nr_list = ('Off','Light','Full')
         ComboLabel(import_settings, 'FBDD Noise Reduction:', 5, fbdd_nr_list, 'fbdd_nr', advanced_widgets, width=25)
         MultiEntryLabel(import_settings, 'Noise Threshold', 6, 0, 1000, 1, key='noise_thr', widget_dictionary=advanced_widgets, increment=50, width=25)
-        use_camera_wb = CheckLabel(import_settings, 'Use Camera White Balance:', 8, 'use_camera_wb', advanced_widgets, command=set_wb)
-        try:
-            wb_lbl = f'White Balance Multipliers ({self.current_photo.colour_desc}):'
-        except Exception as e:
-            wb_lbl = 'White Balance Multipliers:'
-        wb_mult = MultiEntryLabel(import_settings, wb_lbl, 9, 0, 4, 4, key='wb_mult', widget_dictionary=advanced_widgets, is_float=True, increment=0.1, width=25)
 
         MultiEntryLabel(process_settings, 'Max Proxy Size (W + H):', 0, 500, 20000, 1, key='max_proxy_size', widget_dictionary=advanced_widgets, increment=500)
         MultiEntryLabel(process_settings, 'Photo Preload Buffer Size:', 1, 0, 20, 1, key='preload', widget_dictionary=advanced_widgets)
-        MultiEntryLabel(process_settings, 'EQ Ignore Borders % (W, H)', 2, 0, 40, 2, key='ignore_border', widget_dictionary=advanced_widgets)
-        CheckLabel(process_settings, 'EQ Ignore Negative Borders:', 3, 'ignore_neg_border', advanced_widgets, default_value=True)
-        MultiEntryLabel(process_settings, 'White Point Percentile:', 4, 70, 100, 1, key='white_point_percentile', widget_dictionary=advanced_widgets, is_float=True)
-        MultiEntryLabel(process_settings, 'Black Point Percentile:', 5, 0, 30, 1, key='black_point_percentile', widget_dictionary=advanced_widgets, is_float=True)
+        MultiEntryLabel(process_settings, 'Analysis Border % (W, H)', 2, 0, 40, 2, key='ignore_border', widget_dictionary=advanced_widgets)
+        CheckLabel(process_settings, 'Analysis Includes Negative Border:', 3, 'ignore_neg_border', advanced_widgets, default_value=True)
         MultiEntryLabel(process_settings, 'Colour Picker Radius (%)', 6, 0.5, 10, 1, key='picker_radius', widget_dictionary=advanced_widgets, is_float=True, increment=0.5)
 
         MultiEntryLabel(dust_settings, 'Threshold:', 0, 0, 50, 1, key='dust_threshold', widget_dictionary=advanced_widgets)
         MultiEntryLabel(dust_settings, 'Noise Closing Iterations:', 1, 1, 10, 1, key='dust_iter', widget_dictionary=advanced_widgets)
         MultiEntryLabel(dust_settings, 'Max Particle Area:', 2, 0, 100, 1, key='max_dust_area', widget_dictionary=advanced_widgets)
 
+        ComboLabel(export_settings, 'Output Colour Space:', 3, ('sRGB','Adobe RGB'), 'output_colour_space', advanced_widgets, False, output_list=('sRGB','Adobe RGB'), width=20)
         MultiEntryLabel(export_settings, 'JPEG Quality:', 0, 0, 100, 1, key='jpg_quality', widget_dictionary=advanced_widgets, increment=10)
         tiff_comp_list = ['No Compression','Lempel-Ziv & Welch','Adobe Deflate (ZIP)','PackBits']
         tiff_comp_out = [1, 5, 8, 32773]
@@ -447,7 +461,6 @@ class BaseGUI(ABC):
 
         set_widgets(RawProcessing.class_parameters)
         set_widgets(self.advanced_settings)
-        set_wb()
 
         buttonFrame = ttk.Frame(mainFrame)
         buttonFrame.grid(row=1, column=0, columnspan=2, sticky='e')
@@ -606,6 +619,7 @@ class BaseGUI(ABC):
         result_photo = ImageTk.PhotoImage(self.resize_IMG(self.current_photo.get_preview_img()))
         self.result_photo.configure(image=[result_photo])
         self.result_photo.image = result_photo
+        self._update_effective_grade()
         self.master.update_idletasks()
 
         if full_res:
@@ -671,8 +685,9 @@ class BaseGUI(ABC):
         else:
             self.reject_check.enable()
 
-        self.base_rgb.set(str(self.current_photo.base_rgb)) 
-        self.rgb_display.configure(bg=self._from_rgb(self.current_photo.base_rgb))
+        self._set_base_display(self.current_photo.base_rgb)
+        self._refresh_papers()
+        self._sync_temperature()
 
         self.update_UI()
 
@@ -737,8 +752,14 @@ class BaseGUI(ABC):
             self.editmenu.entryconfigure('Reset to Default Settings', state=tk.NORMAL)
         
         self._update_export_controls()
+
+        film = self.film_type.get()
+        for widget in self.clip_widgets:
+            widget.hide() if film == 2 else widget.show() # a slide uses a fixed density window, no clip metering
+        for key in ('crosstalk_profile', 'crosstalk_strength'):
+            self.widgets[key].show() if film == 1 else self.widgets[key].hide()
         
-        if self.base_mode.get():
+        if self.base_mode.get() and film == 1:
             self.base_clr_lbl.grid(row=1, column=0, sticky=tk.E)
             self.base_rgb_lbl.grid(row=1, column=1, sticky=tk.W)
             self.rgb_display.grid(row=1, column=2, sticky=tk.W)
@@ -813,23 +834,22 @@ class BaseGUI(ABC):
                 x = event.x / event.widget.winfo_width()
                 y = event.y / event.widget.winfo_height()
                 self.current_photo.set_wb_from_picker(x, y) # set the white balance to neutral at the x, y coordinates of the mouse click
-
-                self.temp.set(self.current_photo.temp)
-                self.tint.set(self.current_photo.tint)
+                picked = {key: getattr(self.current_photo, key) for key in ('wb_cyan', 'wb_magenta', 'wb_yellow')}
+                for key, value in picked.items():
+                    self.widgets[key].set(value)
+                self._sync_temperature()
 
                 if self.glob_check.get():
                     affected = sum([photo.use_global_settings for photo in self.photos])
                     if affected > 1:
                         if messagebox.askyesno('White Balance Picker', f'Do you want to apply this white balance adjustment globally to {str(affected)} photos?', default='no'):
-                            self.global_settings['temp'] = self.temp.get()
-                            self.global_settings['tint'] = self.tint.get()
+                            self.global_settings.update(picked)
                             self.changed_global_settings()
                         else:
                             self.glob_check.set(False)
                             self.current_photo.use_global_settings = False
                     else:
-                        self.global_settings['temp'] = self.temp.get()
-                        self.global_settings['tint'] = self.tint.get()
+                        self.global_settings.update(picked)
                         self.changed_global_settings()
                 self.update_IMG()
                 self.unsaved = True
@@ -870,15 +890,16 @@ class BaseGUI(ABC):
     # logic to get the base rgb value, and configure the GUI accordingly
     def set_base_rgb(self, mode):
         match mode:
-            case 0: # set rgb from colour picker
+            case 0: # set rgb from colour chooser (8-bit values as displayed)
                 try:
-                    colour = self.current_photo.base_rgb
-                except Exception as e: 
+                    colour = self._base_swatch(self.current_photo.base_rgb)
+                except Exception as e:
                     logger.exception(f'Exception: {e}')
                     colour = None
                 rgb, _ = colorchooser.askcolor(colour, title='Enter Film Base RGB')
                 if rgb is None:
                     return
+                rgb = self._swatch_to_linear(rgb)
             case 1: # pick colour from RAW image
                 rgb = self.current_photo.base_rgb
             case 2: # pick colour from blank scan
@@ -889,28 +910,118 @@ class BaseGUI(ABC):
                     logger.exception(f'Exception: {e}')
                     return
                 blank = RawProcessing(filename, self.default_settings, self.global_settings, self.config_path)
+                blank.film_type = 1
                 blank.load()
                 if blank.FileReadError:
                     messagebox.showerror('Read Blank', 'RAW image could not be read. Verify the integrity of the RAW image.')
-                raw_img = cv2.convertScaleAbs(blank.RAW_IMG, alpha=(255.0/65535.0))[:,:,::-1]
-                brightness = np.sum(raw_img.astype(np.uint16), 2)
-                sample = np.percentile(brightness, 90) # take sample at 90th percentile brightest pixel
-                index = np.where(brightness==sample)
-                rgb = raw_img[index[0][0]][index[1][0]]
-                rgb = tuple(rgb.tolist())
+                    return
+                rgb = blank.blank_base_colour() # linear colour at the 90th percentile brightest pixels
+                blank.clear_memory()
 
         if self.glob_check.get():
             self.global_settings['base_rgb'] = rgb
             self.changed_global_settings()
-        self.base_rgb.set(str(rgb)) 
-        self.rgb_display.configure(bg=self._from_rgb(rgb))
+        self._set_base_display(rgb)
         if len(self.photos) == 0:
             return
         self.current_photo.base_rgb = rgb
         self.current_photo.process(skip_crop=True)
         self.update_IMG()
         self.unsaved = True
-    
+
+    # --- film base helpers: the photo stores a linear RGB triple, the GUI shows its display-encoded swatch
+    def _display_lut(self):
+        photo = getattr(self, 'current_photo', None)
+        lut = getattr(photo, '_display_lut', None)
+        if lut is None:
+            from conversion.decode import build_display_lut
+            lut = build_display_lut(1.0)
+        return lut
+
+    def _base_swatch(self, rgb):
+        if rgb is None:
+            return (128, 128, 128)
+        lut = self._display_lut()
+        idx = np.clip(np.rint(np.asarray(rgb, dtype=np.float64)[:3] * 65535), 0, 65535).astype(np.int64)
+        return tuple(int(lut[i]) for i in idx)
+
+    def _swatch_to_linear(self, rgb):
+        lut = self._display_lut()
+        return tuple(float(np.searchsorted(lut, int(round(c)), side='left')) / 65535.0 for c in rgb)
+
+    def _set_base_display(self, rgb):
+        swatch = self._base_swatch(rgb)
+        self.base_rgb.set(str(swatch) if rgb is not None else 'Auto')
+        self.rgb_display.configure(bg=self._from_rgb(swatch))
+
+    # --- colour temperature is derived from magenta/yellow filtration, never stored
+    def _sync_temperature(self):
+        try:
+            kelvin = wb_to_kelvin(self.widgets['wb_magenta'].get(), self.widgets['wb_yellow'].get())
+            self.temperature.set(int(round(min(max(kelvin, 3000), 12000))))
+        except Exception as e:
+            logger.info(f'Could not derive temperature: {e}')
+
+    def _set_filtration(self, values):
+        # writes magenta/yellow to the widgets, the current photo and (when synced) the global settings
+        for key, value in values.items():
+            self.widgets[key].set(value)
+            if hasattr(self, 'current_photo'):
+                setattr(self.current_photo, key, value)
+            if self.glob_check.get():
+                self.global_settings[key] = value
+        if self.glob_check.get():
+            self.changed_global_settings()
+
+    def temperature_changed(self, widget):
+        m, y = kelvin_to_wb(widget.get(), self.widgets['wb_magenta'].get(), self.widgets['wb_yellow'].get())
+        self._set_filtration({'wb_magenta': m, 'wb_yellow': y})
+        if len(self.photos) == 0:
+            return
+        self.current_photo.process(skip_crop=True)
+        self.update_IMG()
+        self.unsaved = True
+
+    def filtration_changed(self, widget):
+        self.widget_changed(widget, 'skip crop')
+        self._sync_temperature()
+
+    # --- film type switches reset Cast Removal / autos to the mode's defaults and refresh the paper list
+    def film_type_changed(self, widget):
+        film = widget.get()
+        current = {key: self.widgets[key].get() for key in ('cast_removal', 'auto_density', 'auto_grade')}
+        for key, value in mode_defaults(film, current).items():
+            if value != current[key]:
+                self.widgets[key].set(value)
+                if self.glob_check.get():
+                    self.global_settings[key] = value
+                if hasattr(self, 'current_photo'):
+                    setattr(self.current_photo, key, value)
+        if hasattr(self, 'current_photo'):
+            self.current_photo.film_type = film
+        self._refresh_papers(film)
+        self.widget_changed(widget)
+
+    def _refresh_papers(self, film=None):
+        film = self.film_type.get() if film is None else film
+        mode = {0: ProcessMode.BW, 2: ProcessMode.E6}.get(film, ProcessMode.C41)
+        profiles = profiles_for_mode(mode)
+        keys = [key for key, _ in profiles]
+        labels = [getattr(profile, 'label', None) or getattr(profile, 'name', None) or key for key, profile in profiles]
+        self.paper_keys[:] = keys
+        self.paper_combo.values = labels
+        self.paper_combo.combobox.configure(values=labels)
+        wanted = getattr(getattr(self, 'current_photo', None), 'paper_profile', 'neutral')
+        if wanted not in keys:
+            wanted = keys[0]
+            if hasattr(self, 'current_photo'):
+                self.current_photo.paper_profile = wanted
+        self.paper_combo.set(wanted)
+
+    def _update_effective_grade(self):
+        grade = self.current_photo.effective_grade() if hasattr(self, 'current_photo') else None
+        self.effective_grade_lbl.configure(text='' if grade is None else f'Effective grade R{grade:.0f}')
+
     def set_base(self):
         # enables the base colour picker
         if len(self.photos) == 0:
@@ -941,7 +1052,7 @@ class BaseGUI(ABC):
         
         self.update_progress(20, 'Processing...') # Arbitrary progress display
         self._load_photo(self.current_photo, full_res=True)
-        self.current_photo.process(True)
+        self.current_photo.process(True, for_export=True)
         self.update_progress(99, self._individual_export_progress_message())
         
         self._export_photo(

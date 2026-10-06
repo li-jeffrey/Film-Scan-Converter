@@ -36,3 +36,8 @@ exclude_commit_patterns = [
     "^test:",
     "^ci:",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["source"]
+testpaths = ["tests"]
+markers = ["slow: slow benchmarks"]

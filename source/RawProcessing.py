@@ -1,14 +1,29 @@
-import rawpy
+import dataclasses
+import logging
+import os
+import threading
+
 import cv2
 import numpy as np
-import tifffile
+import rawpy  # noqa: F401  (imported so a missing rawpy fails loudly at startup)
 from PIL import Image
-import matplotlib.colors
-import os 
 
-import logging
+from conversion import decode, icc, pipeline
+from conversion.params import (
+    FILM_TYPE_BW,
+    FILM_TYPE_CROP,
+    FILM_TYPE_SLIDE,
+    SETTINGS_VERSION,
+    SPEC_DEFAULTS,
+    from_photo,
+    migrate_v1,
+)
+from conversion.print_curve import calculate_wb_shifts_from_log
 
 logger = logging.getLogger(__name__)
+
+ANALYSIS_LONG_EDGE = 2048
+
 
 class RawProcessing:
     # This class defines a photo object that contains the image processing pipeline from raw to final export, including all processing functions and parameters
@@ -20,18 +35,13 @@ class RawProcessing:
         jpg_quality = 90, # from 0-100
         tiff_compression = 8, # defines the tiff compression algorithm
         dm_alg = 2, # demosaicing algorithm
-        colour_space = 7, # output colour space after demosaicing
-        exp_shift = 3.0, # number of stops to adjust the raw
         fbdd_nr = 0, # noise reduction on demosaic
-        raw_gamma = (2.222, 4.5), # (power, slope) for RAW image
-        use_camera_wb = True, # use built-in wb parameters from camera
-        wb_mult = [1, 1, 1, 1], # multipliers for each 2x2 bayer pattern
         noise_thr = 0, # for RAW denoising
         median_filter_passes = 0, # can reduce colour artifacts during demosaicing
-        black_point_percentile = 0.5, # sets the black point
-        white_point_percentile = 99.0, # sets the default white balance as a percentile of the brightest pixels
-        ignore_border = (1, 1), # ignores the border for calculation of histogram EQ
-        ignore_neg_border = True, # ignores negative border space for calculation of histogram EQ
+        ignore_border = (5, 5), # analysis border (% of the crop) excluded from metering
+        ignore_neg_border = True, # ignores negative border space for metering
+        output_colour_space = 'sRGB', # export colour space: sRGB / Adobe RGB
+        input_encoding = 'Auto', # encoding of non-RAW 16-bit files without a profile: Auto / sRGB / Linear
         dust_threshold = 10,
         max_dust_area = 15,
         dust_iter = 5,
@@ -41,8 +51,9 @@ class RawProcessing:
     )
     class_parameters = default_parameters.copy()
     advanced_attrs = [key for key in default_parameters.keys() if key not in ('filetype', 'frame', 'fit_aspect_ratio')] # list of keys for advanced settings, except for keys that should not be saved
-    processing_parameters = ('dark_threshold','light_threshold','border_crop','flip','rotation','film_type','white_point','black_point','gamma','shadows','highlights','temp','tint','sat','reject','base_detect','base_rgb','remove_dust')
-    
+    conversion_parameters = tuple(SPEC_DEFAULTS.keys()) # per-photo conversion controls (see conversion.params.SPECS)
+    processing_parameters = ('dark_threshold','light_threshold','border_crop','flip','rotation','film_type','reject','base_detect','base_rgb','remove_dust') + conversion_parameters
+
     def __init__(self, file_directory, default_settings, global_settings, config_path):
         # file_directory: the name of the RAW file to be processed
         # Instance Variables
@@ -55,12 +66,13 @@ class RawProcessing:
         self.filename = os.path.basename(self.file_directory)
         self.colour_desc = None # RAW bayer colour description
         self.config_path = config_path
+        self._init_caches()
         # initializing raw processing parameters
         try: # to read in the parameters from a saved file
-            directory = os.path.join(self.config_path, f"{self.filename.split('.')[0]}.npy")
+            directory = os.path.join(self.config_path, f"{os.path.splitext(self.filename)[0]}.npy")
             params_dict = np.load(directory, allow_pickle=True).item()
         except Exception as e:# file does not exist
-            logger.exception(f'Exception: {e}')
+            logger.info(f'No saved settings for {self.filename}: {e}')
             for attr in self.processing_parameters:
                 if attr in global_settings:
                     setattr(self, attr, global_settings[attr]) # Initializes every instance parameter based on default value
@@ -68,6 +80,8 @@ class RawProcessing:
                     setattr(self, attr, 0) # otherwise set to 0
             self.use_global_settings = True # tells GUI class whether to overwrite current photo settings with global setting
         else: # import successful
+            if params_dict.get('settings_version', 1) < SETTINGS_VERSION:
+                params_dict = migrate_v1(params_dict) # old per-photo settings: keep geometry/film type, reset the conversion
             for attr in self.processing_parameters:
                 if attr in params_dict:
                     setattr(self, attr, params_dict[attr]) # Initializes every instance parameter with imported parameters
@@ -77,81 +91,107 @@ class RawProcessing:
                     setattr(self, attr, 0) # otherwise set to 0
 
             self.use_global_settings = False # tells GUI class whether to overwrite current photo settings with global setting
-    
+
+    # ------------------------------------------------------------------ caches / pickling
+    def _init_caches(self):
+        self._lock = threading.Lock() # the GUI thread and the full-res preview thread both call process()
+        self._grid = None
+        self._grid_key = None
+        self._analysis = None
+        self._analysis_key = None
+        self._norm = None
+        self._norm_key = None
+        self._img_space = None
+        self._img_full_res = False
+        self._lin_adobe = False
+
+    _ARRAY_ATTRS = ('RAW_LIN', 'RAW_IMG', 'ANALYSIS_SRC', 'proxy_RAW_LIN', 'proxy_RAW_IMG', 'thresh', 'IMG', 'dust_mask', '_grid', '_norm')
+
+    def __getstate__(self):
+        # Batch export pickles photos into worker processes: drop the arrays and the lock, keep the small Analysis
+        state = self.__dict__.copy()
+        for attr in self._ARRAY_ATTRS + ('_lock',):
+            state.pop(attr, None)
+        state['_grid'] = None
+        state['_norm'] = None
+        state['_norm_key'] = None
+        state['processed'] = False
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------ loading
+    def _camera_gain(self):
+        # As-shot WB as a linear gain: negatives/B&W only (slides fold it into the camera matrix)
+        if self.film_type == FILM_TYPE_SLIDE or getattr(self, 'camera_wb', None) is None:
+            return None
+        return self.camera_wb
+
     def load(self, full_res=False):
+        self.camera_wb = None
+        self.rgb_xyz_matrix = None
+        self.is_raw = False
         try:
-            with rawpy.imread(self.file_directory) as raw: # tries to read as raw file
-                self.RAW_IMG = raw.postprocess(
-                    output_bps = 16, # output 16-bit image
-                    use_camera_wb = self.class_parameters['use_camera_wb'], # Screws up the colours if not used
-                    user_wb = self.class_parameters['wb_mult'], # wb multipliers
-                    demosaic_algorithm = rawpy.DemosaicAlgorithm(self.class_parameters['dm_alg']),
-                    fbdd_noise_reduction = rawpy.FBDDNoiseReductionMode(self.class_parameters['fbdd_nr']),
-                    output_color = rawpy.ColorSpace(self.class_parameters['colour_space']),
-                    gamma = self.class_parameters['raw_gamma'],
-                    auto_bright_thr = 0, # no clipping of highlights
-                    median_filter_passes = self.class_parameters['median_filter_passes'],
-                    noise_thr = self.class_parameters['noise_thr'],
-                    exp_preserve_highlights = 1,
-                    exp_shift = 2 ** self.class_parameters['exp_shift'],
-                    half_size = not full_res # take the average of 4 pixels to reduce resolution and computational requirements
-                    )
-                self.colour_desc = raw.color_desc.decode('utf-8') # get the bayer pattern
+            lin, meta = decode.decode_raw(self.file_directory, self.class_parameters, full_res)
+            self.camera_wb, self.rgb_xyz_matrix, self.colour_desc = meta.camera_wb, meta.rgb_xyz_matrix, meta.colour_desc
+            self.is_raw = True
         except Exception as _:
             try:
-                self.RAW_IMG = cv2.imread(self.file_directory, cv2.IMREAD_UNCHANGED) # if fails, reads as normal image
-                if type(self.RAW_IMG) is not np.ndarray:
-                    raise Exception(f'{self.file_directory} failed to load!')
+                to_adobe = (self.film_type == FILM_TYPE_SLIDE)
+                loaded = decode.load_non_raw(self.file_directory, self.class_parameters['input_encoding'], to_adobe)
+                lin = loaded.lin
+                self._lin_adobe = loaded.in_adobe_primaries
             except Exception as e:
                 logger.exception(f'Exception: {e}') # If fails again, set error attributes
                 self.reject = True
                 self.FileReadError = True
                 return
-            else:
-                if self.RAW_IMG.dtype == np.uint8:
-                    self.RAW_IMG = (self.RAW_IMG).astype(np.uint16, copy=False) * 256 # converts image to 16-bit
-        else:
-            # RawPy sometimes misreads the RAW image size, this removes any extra black borders
-            gray = cv2.cvtColor(cv2.convertScaleAbs(self.RAW_IMG, alpha=(255.0/65535.0)),cv2.COLOR_RGB2GRAY)
-            _, thresh = cv2.threshold(gray,0,255,0)
-            contours, _ = cv2.findContours(thresh,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-            del gray, thresh
-            cnt = max(contours, key=cv2.contourArea)
-            x,y,w,h = cv2.boundingRect(cnt)
-            self.RAW_IMG = self.RAW_IMG[y:y+h,x:x+w,::-1]
-        
-        self.FileReadError = False
-        self.memory_alloc = self.RAW_IMG.nbytes * 4 * 12 # estimation of memory requirements based on the size of the image
+        self._set_source(lin)
 
     def load_lightroom_tiff(self):
-        # 16-bit TIFF from Lightroom (uncompressed or LZW; ProPhoto RGB / Display P3 ICC)
+        # 16-bit Adobe RGB TIFF from Lightroom; linearized with its embedded profile. Export always embeds AdobeCompat.
+        self.camera_wb = None
+        self.rgb_xyz_matrix = None
+        self.is_raw = False
+        self.lightroom = True
         try:
-            with Image.open(self.file_directory) as pil_img:
-                self.tiff_icc_profile = pil_img.info.get('icc_profile')
-                comp_tag = pil_img.tag_v2.get(259) if hasattr(pil_img, 'tag_v2') else None
-                self.tiff_compression_tag = comp_tag  # 1 = none, 5 = LZW
-
-                arr = np.asarray(pil_img)
-                if arr.ndim == 2:
-                    arr = np.stack([arr, arr, arr], axis=-1)
-                elif arr.ndim == 3 and arr.shape[2] == 4:
-                    arr = arr[:, :, :3]
-                if arr.dtype == np.uint8:
-                    arr = arr.astype(np.uint16) * 256
-                elif arr.dtype != np.uint16:
-                    arr = np.clip(arr, 0, 65535).astype(np.uint16)
-
-                if arr.shape[-1] < 3:
-                    raise ValueError('TIFF must have at least three colour channels')
-                self.RAW_IMG = np.ascontiguousarray(arr[:, :, :3][:, :, ::-1])  # RGB -> BGR
+            loaded = decode.load_lightroom_tiff(self.file_directory)
+            self._lin_adobe = loaded.in_adobe_primaries
+            self._set_source(loaded.lin)
         except Exception as e:
             logger.exception(f'Exception: {e}')
             self.reject = True
             self.FileReadError = True
-            return
 
+    def _set_source(self, lin):
+        # lin: linear uint16 RGB. Builds the display copy (RAW_IMG, BGR) and the metering source
+        lin = np.ascontiguousarray(lin)
+        wb_lin = decode.apply_wb(lin, self.camera_wb) # as-shot WB for display only
+        gain = decode.display_gain(wb_lin)
+        self._display_lut = decode.build_display_lut(gain)
+        disp = decode.apply_display_lut(wb_lin, self._display_lut, bgr=True, bits16=True)
+        if wb_lin is not lin:
+            del wb_lin
+        if self.is_raw:
+            # RawPy sometimes misreads the RAW image size, this removes any extra black borders
+            gray = cv2.cvtColor(cv2.convertScaleAbs(disp, alpha=(255.0/65535.0)), cv2.COLOR_BGR2GRAY)
+            x, y, w, h = decode.black_border_box(gray)
+            lin = np.ascontiguousarray(lin[y:y+h, x:x+w])
+            disp = np.ascontiguousarray(disp[y:y+h, x:x+w])
+        self.RAW_LIN = lin
+        self.RAW_IMG = disp
+        h, w = lin.shape[:2]
+        scale = ANALYSIS_LONG_EDGE / max(h, w)
+        if scale < 1:
+            self.ANALYSIS_SRC = cv2.resize(lin, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
+        else:
+            self.ANALYSIS_SRC = lin
+        self._grid = self._analysis = self._norm = None
+        self._grid_key = self._analysis_key = self._norm_key = None
         self.FileReadError = False
-        self.memory_alloc = self.RAW_IMG.nbytes * 4 * 12
+        self.memory_alloc = self.RAW_LIN.nbytes * 5 # estimation of memory requirements based on the size of the image
 
     def _render_image(self, output=None):
         # Returns a numpy array for the requested processing stage (export or preview source).
@@ -227,42 +267,54 @@ class RawProcessing:
         if img.ndim == 2:
             return Image.fromarray(img, mode='L')
         return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        
+
     def __str__(self):
         # returns file name when str() is called on photo
         return os.path.basename(self.file_directory)
-    
-    def export(self, filename):
-        # Saves final image to disk.
-        # filename: base path without extension (standard export), full path for Lightroom Edit In (16-bit TIFF, preserves ICC)
-        if not hasattr(self, 'IMG'):
-            return
+
+    # ------------------------------------------------------------------ export
+    def _export_space(self, lightroom=False):
+        if self.film_type == FILM_TYPE_CROP:
+            return 'display'
+        if self.film_type == FILM_TYPE_BW:
+            return 'Gray'
+        return 'Adobe RGB' if lightroom else self.class_parameters['output_colour_space']
+
+    def _ensure_space(self, space):
+        # IMG is rendered in sRGB for previews; re-render when the export needs another space
+        if getattr(self, '_img_space', None) != space or not hasattr(self, 'IMG'):
+            self.process(self._img_full_res, skip_crop=True, for_export=True, out_space=None if space in ('display', 'Gray') else space)
+
+    def _icc_for(self, space):
+        if space == 'display':
+            return None
+        return icc.bundled_icc(space)
+
+    def _write(self, filename, space):
         img = self.get_export_img()
-        filename = f"{filename}.{self.class_parameters['filetype']}"
-        match self.class_parameters['filetype']:
-            case 'JPG':
-                quality = [cv2.IMWRITE_JPEG_QUALITY, self.class_parameters['jpg_quality']]
-                cv2.imwrite(filename, cv2.convertScaleAbs(img, alpha=(255.0/65535.0)), quality) # Must convert to 8-bit image before exporting as JPG
-            case 'TIFF':
-                quality = [cv2.IMWRITE_TIFF_COMPRESSION, self.class_parameters['tiff_compression']]
-                cv2.imwrite(filename, img, quality)
-            case _:
-                cv2.imwrite(filename, img)
+        if img.ndim == 3:
+            img = np.ascontiguousarray(img[:, :, ::-1]) # BGR -> RGB
+        icc.write_image(
+            filename, img, self.class_parameters['filetype'], self._icc_for(space),
+            jpg_quality=self.class_parameters['jpg_quality'], tiff_compression=self.class_parameters['tiff_compression'],
+        )
+
+    def export(self, filename):
+        # Saves final image to disk. filename: base path without extension
+        space = self._export_space()
+        self._ensure_space(space)
+        self._write(f"{filename}.{self.class_parameters['filetype']}", space)
 
     def export_lightroom_tiff(self, filename):
+        space = self._export_space(lightroom=True)
+        self._ensure_space(space)
         img = self.get_export_img()
-        if img.ndim == 2:
-            output = img
-            photometric = 'minisblack'
-        else:
-            output = np.ascontiguousarray(img[:, :, ::-1])  # BGR -> RGB
-            photometric = 'rgb'
+        if img.ndim == 3:
+            img = np.ascontiguousarray(img[:, :, ::-1])
+        import tifffile
         tifffile.imwrite(
-            filename,
-            output,
-            photometric=photometric,
-            compression='deflate',
-            iccprofile=getattr(self, 'tiff_icc_profile', None),
+            filename, img, photometric='minisblack' if img.ndim == 2 else 'rgb', compression='deflate',
+            iccprofile=self._icc_for(space),
         )
 
     def save_settings(self):
@@ -271,87 +323,117 @@ class RawProcessing:
         params_dict = dict()
         for attr in self.processing_parameters:
             params_dict[attr] = getattr(self, attr)
+        params_dict['settings_version'] = SETTINGS_VERSION
         np.save(directory, params_dict)
-    
-    def process(self, full_res=False, recent_only=False, skip_crop=False):
+
+    # ------------------------------------------------------------------ processing
+    def _params(self):
+        params = from_photo(self)
+        # Film base override only applies to colour negatives with a picked/imported base
+        if params.base_rgb is not None and not (self.base_detect and self.film_type == 1):
+            params = dataclasses.replace(params, base_rgb=None)
+        return params
+
+    def _crop_key(self):
+        return (self.border_crop, self.dark_threshold, self.light_threshold, tuple(self.class_parameters['ignore_border']), self.class_parameters['ignore_neg_border'])
+
+    def _ensure_analysis(self, params, cam_matrix):
+        # Metering on the 2048 px analysis source (so preview and export agree), cached on the keys it depends on
+        key = (params.analysis_key(), self._crop_key(), self.class_parameters['dm_alg'])
+        with self._lock:
+            if self._analysis is not None and self._analysis_key == key:
+                return self._analysis
+            gkey = (params.grid_key(), self._crop_key())
+            if self._grid is None or self._grid_key != gkey:
+                src = self.crop(self.ANALYSIS_SRC, self.rect, include_EQ_ignore=True)
+                src = decode.apply_wb(src, self._camera_gain())
+                self._grid = pipeline.build_grid(src, params, cam_matrix)
+                self._grid_key = gkey
+            self._analysis = pipeline.analyze(self._grid, params)
+            self._analysis_key = key
+            return self._analysis
+
+    def process(self, full_res=False, recent_only=False, skip_crop=False, for_export=False, out_space=None):
         # Selection of appropriate film processing type
         # full_res uses the full resolution raw image for processing, otherwise use downsampled proxy
         # recent_only will not update final output if multiple, more recent processes are started before it finishes
         # skip_crop: skip calculating crop (faster if crop parameters have not changed)
+        # for_export: render in the Advanced output colour space instead of sRGB
         if not hasattr(self, 'RAW_IMG'):
             self.load() # tries to load file if it hasn't already been done
         if self.FileReadError:
             return # Do not process if the file could not be read
+        if not self.is_raw and not getattr(self, 'lightroom', False) and (self.film_type == FILM_TYPE_SLIDE) != self._lin_adobe:
+            self.load() # non-RAW slides need Adobe-primaries input; reload when the film type crosses that line
+            if self.FileReadError:
+                return
+            skip_crop = False
         self.active_processes += 1 # Used to keep track of the number of processes currently running
 
-        if not skip_crop or not hasattr(self, 'thresh'):
-            self.thresh, self.rect, self.largest_contour = self.find_optimal_crop()
-            
-            img_size = self.RAW_IMG.shape[0] + self.RAW_IMG.shape[1]
-            if (img_size > self.class_parameters['max_proxy_size']): # Checks if image is larger than the allowable size, if yes, then generate proxy images to speed up preview generation
-                # Downscales the image to a smaller size
-                scale_factor = self.class_parameters['max_proxy_size'] / img_size
-                x = int(self.RAW_IMG.shape[1] * scale_factor)
-                y = int(self.RAW_IMG.shape[0] * scale_factor)
-                self.proxy_RAW_IMG = cv2.resize(self.RAW_IMG, (x, y))
-                self.proxy = True # Flag to tell the rest of the program that proxies are being used
+        try:
+            if not skip_crop or not hasattr(self, 'thresh'):
+                self.thresh, self.rect, self.largest_contour = self.find_optimal_crop()
 
-        # Uses a proxy to generate preview, when needed. During final export, will use full resolution
-        if self.proxy and not full_res:
-            img = self.proxy_RAW_IMG
-        else:
-            img = self.RAW_IMG
+                self.proxy = False
+                img_size = self.RAW_IMG.shape[0] + self.RAW_IMG.shape[1]
+                if (img_size > self.class_parameters['max_proxy_size']): # Checks if image is larger than the allowable size, if yes, then generate proxy images to speed up preview generation
+                    # Downscales the image to a smaller size
+                    scale_factor = self.class_parameters['max_proxy_size'] / img_size
+                    x = int(self.RAW_IMG.shape[1] * scale_factor)
+                    y = int(self.RAW_IMG.shape[0] * scale_factor)
+                    self.proxy_RAW_IMG = cv2.resize(self.RAW_IMG, (x, y), interpolation=cv2.INTER_AREA)
+                    self.proxy_RAW_LIN = cv2.resize(self.RAW_LIN, (x, y), interpolation=cv2.INTER_AREA)
+                    self.proxy = True # Flag to tell the rest of the program that proxies are being used
+                    self._norm = None
 
-        dust_mask = self.find_dust(self.crop(img, self.rect))
+            # Uses a proxy to generate preview, when needed. During final export, will use full resolution
+            use_proxy = self.proxy and not full_res
+            disp = self.proxy_RAW_IMG if use_proxy else self.RAW_IMG
+            lin = self.proxy_RAW_LIN if use_proxy else self.RAW_LIN
 
-        # Additional processing specific to each film type
-        match self.film_type:
-            case 0:
-                img = self.bw_negative_processing(img)
-            case 1:
-                img = self.colour_negative_processing(img)
-            case 2:
-                img = self.slide_processing(img)
-            case 3:
-                img = self.crop_only(img)
-        
-        img = self.crop(img, self.rect)
+            dust_mask = self.find_dust(self.crop(disp, self.rect))
 
-        self.active_processes -= 1
+            if self.film_type == FILM_TYPE_CROP:
+                img = self.crop(disp, self.rect) # camera-space display transform, no conversion
+                space = 'display'
+            else:
+                params = self._params()
+                cam_matrix = pipeline.camera_matrix(params, getattr(self, 'rgb_xyz_matrix', None), getattr(self, 'camera_wb', None))
+                analysis = self._ensure_analysis(params, cam_matrix)
+                lin = decode.apply_wb(self.crop(lin, self.rect), self._camera_gain()) # crop before converting: every step is per-pixel
+                space = out_space or (params.output_colour_space if for_export else 'sRGB')
+                norm = None
+                if not full_res:
+                    nkey = (params.norm_key(), self._crop_key())
+                    with self._lock:
+                        if self._norm is None or self._norm_key != nkey:
+                            self._norm = pipeline.normalize(lin, params, analysis, cam_matrix)
+                            self._norm_key = nkey
+                        norm = self._norm
+                img = pipeline.render(lin, params, analysis, space, norm=norm, cam_matrix=cam_matrix, bgr=True)
+                if self.film_type == FILM_TYPE_BW:
+                    space = 'Gray'
+        finally:
+            self.active_processes -= 1
         if recent_only and (self.active_processes > 0):
             return # skip displaying final image if it is not the last active process
 
         # Set all the global variables once processing is finished
         self.IMG = img
+        self._img_space = space
+        self._img_full_res = full_res
         self.dust_mask = dust_mask
         self.processed = True
 
-    def bw_negative_processing(self, img):
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) # converts to b/w
-        img = 65535 - img # invert to create positive image
-        img = self.hist_EQ(img) # increases contrast to maximize dynamic range
-        img = self.exposure(img) # exposure adjustment
-        img = img.clip(0, 65535).astype(np.uint16, copy=True)
-        return img
+    def effective_grade(self):
+        # Read-out for the "Effective grade" label (None when not applicable)
+        if self.film_type in (FILM_TYPE_CROP, FILM_TYPE_SLIDE) or self._analysis is None:
+            return None
+        try:
+            return pipeline.effective_grade(self._params(), self._analysis)
+        except Exception:
+            return None
 
-    def colour_negative_processing(self, img):
-        img = 65535 - img # invert to create positive image
-        img = self.slide_processing(img) # The rest of the processing is identical to slide_processing
-        return img
-    
-    def slide_processing(self, img):
-        img = self.hist_EQ(img) # Maximizes dynamic range
-        wb_mode = [self.wb_adjust, self.wb_adjust_coeff, self.wb_adjust_gamma] # different ways to adjust wb, for debugging
-        img = wb_mode[1](img) # modifiers for white balancing
-        img = self.exposure(img) # Exposure adjustment
-        img = self.sat_adjust(img) # modifier for colour saturation
-        img = img.clip(0, 65535).astype(np.uint16, copy=True)
-        return img
-        
-    def crop_only(self, img):
-        # No processing required
-        return img
-    
     def find_dust(self, img):
         # work in progress. Tries to detect dust particles of a maximum size, then returns threshold image of just dust
         y, x, _ = img.shape
@@ -474,140 +556,6 @@ class RawProcessing:
         thresh_img = cv2.erode(thresh_img, kernel, iterations = 2)
         return thresh_img
     
-    def hist_EQ(self, img):
-        # Equalizes histogram for each color channel
-        sensitivity = 0.2 # multiplier to adjust degree at which the sliders affect the output image
-
-        sample_img = self.crop(img, self.rect, include_EQ_ignore=True)
-
-        if self.base_detect and (self.film_type == 1 or self.film_type == 2):
-            if self.film_type == 1:
-                black_point = 65535 - np.array(self.base_rgb, np.uint16)[::-1] * 256
-            else:
-                black_point = np.array(self.base_rgb, np.uint16)[::-1] * 256
-        else:
-            black_point = np.percentile(sample_img, self.class_parameters['black_point_percentile'], (0,1))
-        black_offsets = self.black_point / 100 * sensitivity * 65535 - black_point
-        img = img.astype(np.float64, copy=False)
-        sample_img = sample_img.astype(np.float32, copy=False)
-        
-        img[:,:] += black_offsets # Sets the black point
-        sample_img[:,:] += black_offsets
-
-        max_array = np.ones_like(black_offsets)
-        white_point = np.percentile(sample_img, self.class_parameters['white_point_percentile'], (0,1))
-        white_multipliers = np.divide(65535 + self.white_point / 100 * sensitivity * 65535, white_point, out=max_array, where=white_point>0) # division, but ignore divide by zero or negative
-        img = np.multiply(img, white_multipliers) # Scales the white percentile to 65535
-        return img
-    
-    # \/ Three different white balance functions experimented with \/
-    def wb_adjust(self, img):
-        # Applies white balance adjustment factors as scalars added to RGB, not used
-        # both highlights' and shadows' white balance affected
-        multiplier = 200
-        if self.pick_wb: # logic to calculated temp and tint values from the wb picker
-            self.pick_wb = False
-            x, y, r = self.wb_picker_params # unpacks parameters passed in from white balance picker
-            wb_mask = self.rotate(np.zeros_like(self.crop(img, self.rect)[:,:,0], dtype=np.uint8)) # generate blank mask, rotate to same orientation as preview image
-            # applying scale factors based on image size
-            x = int(x * wb_mask.shape[1])
-            y = int(y * wb_mask.shape[0])
-            radius = int(min(wb_mask.shape) * r)
-
-            wb_mask = cv2.circle(wb_mask, (x, y), radius, 255, -1) # generate small circle to average pixels with
-            wb_mask = self.rotate(wb_mask, True) # rotate image back to default orientation
-            meanBGR = cv2.mean(self.crop(img, self.rect), wb_mask) # returns BGR tuple containing average of unmasked pixels
-            # calculating temp and tint values required to balance average BGR to gray
-            G_offset =  (meanBGR[0] + meanBGR[2]) / 2 - meanBGR[1]
-            RB_offset = meanBGR[0] - (meanBGR[0] + meanBGR[2]) / 2
-            self.temp = max(min(RB_offset / multiplier, 100), -100)
-            self.tint = max(min(G_offset / multiplier, 100), -100)
-        adjustment = np.array([-self.temp * multiplier, -self.tint * multiplier, self.temp * multiplier], np.float32)
-        img = np.add(img, adjustment)
-        return img
-    
-    def wb_adjust_coeff(self, img):
-        # Applies white balance adjustment factors as coefficients multiplied into RGB
-        # only highlights white balance affected
-        multiplier = 200
-        if self.pick_wb: # logic to calculated temp and tint values from the wb picker
-            self.pick_wb = False
-            x, y, r = self.wb_picker_params # unpacks parameters passed in from white balance picker
-            wb_mask = self.rotate(np.zeros_like(self.crop(img, self.rect)[:,:,0], dtype=np.uint8)) # generate blank mask, rotate to same orientation as preview image
-            # applying scale factors based on image size
-            x = int(x * wb_mask.shape[1])
-            y = int(y * wb_mask.shape[0])
-            radius = int(min(wb_mask.shape) * r)
-
-            wb_mask = cv2.circle(wb_mask, (x, y), radius, 255, -1) # generate small circle to average pixels with
-            wb_mask = self.rotate(wb_mask, True) # rotate image back to default orientation
-            B, G, R, _ = cv2.mean(self.crop(img, self.rect), wb_mask) # returns BGR tuple containing average of unmasked pixels
-            # calculating temp and tint values required to balance average BGR to gray
-            self.tint = max(min((G/B+G/R-2)/((B*(G+R)+R*G)/(B*R)) * multiplier, 100), -100)
-            self.temp = max(min(((2*G-(2*G+R)*self.tint/multiplier)/2/R-1) * multiplier, 100), -100)
-        
-        img = np.multiply(img, np.array([1-self.temp/multiplier+self.tint/multiplier/2, 1-self.tint/multiplier, 1+self.temp/multiplier+self.tint/multiplier/2]))
-        return img
-    
-    def wb_adjust_gamma(self, img):
-        # Applies white balance adjustment factors using gamma function, not used
-        # Highlights and shadows stay the same, only midtones' white balance affected
-        img = img / 65535
-        if self.pick_wb: # logic to calculated temp and tint values from the wb picker
-            self.pick_wb = False
-            x, y, r = self.wb_picker_params # unpacks parameters passed in from white balance picker
-            wb_mask = self.rotate(np.zeros_like(self.crop(img, self.rect)[:,:,0], dtype=np.uint8)) # generate blank mask, rotate to same orientation as preview image
-            # applying scale factors based on image size
-            x = int(x * wb_mask.shape[1])
-            y = int(y * wb_mask.shape[0])
-            radius = int(min(wb_mask.shape) * r)
-
-            wb_mask = cv2.circle(wb_mask, (x, y), radius, 255, -1) # generate small circle to average pixels with
-            wb_mask = self.rotate(wb_mask, True) # rotate image back to default orientation
-            meanBGR = cv2.mean(self.crop(img, self.rect), wb_mask) # returns BGR tuple containing average of unmasked pixels
-            # calculating temp and tint values required to balance average BGR to gray
-            target = (meanBGR[0] + meanBGR[2]) / 2
-            self.temp = 100 * np.log2(np.log(target) / np.log(meanBGR[0]))
-            self.tint = -100 * np.log2(np.log(target) / np.log(meanBGR[1]))
-        
-        img = np.power(img, (2 ** np.array([self.temp/100, self.tint/100, -self.temp/100])), dtype=np.float32)
-
-        img = img * 65535 # restores orginal range prior to normalization
-        return img
-    
-    def exposure(self, img):
-        # Exposure adjustment
-        norm = matplotlib.colors.Normalize(0, 65535, True)
-        img = norm(img).astype(np.float32, copy=False)
-        
-        img = (img ** (2 ** (-self.gamma/100))).astype(np.float32, copy=False) # gamma adjustment via gamma correction
-        
-        # Highlights and shadows formula
-        shadows_coefficient = 4.15e-5 * self.shadows ** 2 + 0.02185 * self.shadows
-        img += (shadows_coefficient * np.minimum(img - 0.75, 0) ** 2) * img
-
-        highlights_coefficient = -4.15e-5 * self.highlights ** 2 + 0.02185 * self.highlights
-        img += (highlights_coefficient * np.maximum(img - 0.25, 0) ** 2) * (1 - img)
-
-        img = np.ma.getdata(img, False) # converts masked array back to normal array
-        
-        img = img * 65535 # restores orginal range prior to normalization
-
-        return img
-    
-    def sat_adjust(self, img):
-        # Applies saturation adjustment factors
-        if self.sat == 100:
-            return img # don't run the calculation if no changes are to be made
-        sat_adjust = self.sat / 100
-        norm = matplotlib.colors.Normalize(0, 65535, True)
-        img = norm(np.flip(img, 2)).astype(np.float32, copy=False) # Convert from bgr to rgb, and normalize input to (0,1)
-        img = matplotlib.colors.rgb_to_hsv(img) # Convert from rgb to hsv
-        img[:,:,1] = np.clip(img[:,:,1] * sat_adjust, 0, 1) # Apply saturation adjustment
-        img = matplotlib.colors.hsv_to_rgb(img) # Convert from hsv back to rgb
-        img = np.flip(img, 2) * 65535 # Convert from rgb to bgr
-        return img
-    
     def rotate(self, img, undo=False):
         # Applies flip and rotation to image
         rotation = self.rotation % 4
@@ -698,10 +646,12 @@ class RawProcessing:
 
     def clear_memory(self):
         # Deletes instances of images to save memory
-        to_del = ['IMG', 'thresh', 'RAW_IMG', 'proxy_RAW_IMG', 'dust_mask']
+        to_del = ['IMG', 'thresh', 'RAW_IMG', 'RAW_LIN', 'ANALYSIS_SRC', 'proxy_RAW_IMG', 'proxy_RAW_LIN', 'dust_mask']
         for attr in to_del:
             if hasattr(self, attr):
                 delattr(self, attr)
+        self._grid = self._norm = None
+        self._norm_key = self._grid_key = None
         self.processed = False
 
     def __sizeof__(self):
@@ -711,29 +661,60 @@ class RawProcessing:
             if type(getattr(self, attr)) is np.ndarray:
                 total += getattr(self, attr).nbytes
         return total
-    
+
+    def _picker_mask(self, x, y, shape):
+        # circular mask in the (rotated) preview orientation, returned in the stored orientation
+        mask = self.rotate(np.zeros(shape, dtype=np.uint8))
+        x = int(x * mask.shape[1])
+        y = int(y * mask.shape[0])
+        radius = max(1, int(min(mask.shape) * self.class_parameters['picker_radius'] / 100))
+        mask = cv2.circle(mask, (x, y), radius, 255, -1)
+        return self.rotate(mask, True)
+
     def set_wb_from_picker(self, x, y):
         # x, y normalized between 0 and 1 as a proportion along the image height and width
-        # r is the radius of a small circle to measure the wb as a proportion of the size of the image
-        self.wb_picker_params = (x, y, self.class_parameters['picker_radius'] / 100)
-        self.pick_wb = True # sets flag to measure and set white balance on next processing
+        # Neutralizes the picked patch by setting the magenta/yellow filtration from the cached normalized density
+        self.process() # makes sure the normalized proxy is current
+        if self.film_type in (FILM_TYPE_CROP, FILM_TYPE_BW) or self._norm is None:
+            return
+        norm = self._norm
+        mask = self._picker_mask(x, y, norm.shape[:2]) > 0
+        if not mask.any():
+            return
+        sampled = norm[mask].mean(axis=0)
+        analysis = self._analysis
+        params = self._params()
+        m, yel = calculate_wb_shifts_from_log(sampled, analysis.trimmed_bounds(params))
+        self.wb_cyan = 0.0
+        self.wb_magenta = float(np.clip(m, -1.0, 1.0))
+        self.wb_yellow = float(np.clip(yel, -1.0, 1.0))
         self.process()
-    
+
     def get_base_colour(self, x, y):
         # x, y normalized between 0 and 1 as a proportion along the image height and width
-        # r is the radius of a small circle to measure the base colour as a proportion of the size of the image
-        base_mask = self.rotate(np.zeros_like(self.RAW_IMG[:,:,0], dtype=np.uint8)) # generate blank mask, rotate to same orientation as preview image
-        # applying scale factors based on image size
-        x = int(x * base_mask.shape[1])
-        y = int(y * base_mask.shape[0])
-        radius = int(min(base_mask.shape) * self.class_parameters['picker_radius'] / 100)
+        # Mean linear (as-shot WB) colour under the picker circle becomes the film base
+        mask = self._picker_mask(x, y, self.RAW_LIN.shape[:2]) > 0
+        if not mask.any():
+            return
+        lin = self.RAW_LIN[mask].astype(np.float64) / 65535.0
+        gain = self._camera_gain()
+        if gain is not None:
+            g = np.asarray(gain, dtype=np.float64)[:3]
+            lin = lin * (g / g.max())
+        self.base_rgb = tuple(float(v) for v in lin.mean(axis=0))
 
-        base_mask = cv2.circle(base_mask, (x, y), radius, 255, -1) # generate small circle to average pixels with
-        base_mask = self.rotate(base_mask, True) # rotate image back to default orientation
-        raw = cv2.convertScaleAbs(self.RAW_IMG, alpha=(255.0/65535.0))
-        meanBGR = cv2.mean(raw, base_mask)[:-1] # returns BGR tuple containing average of unmasked pixels
-        self.base_rgb = tuple([round(x) for x in reversed(meanBGR)])
-    
+    def blank_base_colour(self):
+        # Linear (as-shot WB) film base from a blank scan: mean of the pixels around the 90th percentile brightness
+        lin = self.ANALYSIS_SRC.reshape(-1, 3).astype(np.float64) / 65535.0
+        gain = self._camera_gain()
+        if gain is not None:
+            g = np.asarray(gain, dtype=np.float64)[:3]
+            lin = lin * (g / g.max())
+        brightness = lin.sum(axis=1)
+        lo, hi = np.percentile(brightness, (89, 91))
+        band = lin[(brightness >= lo) & (brightness <= hi)]
+        return tuple(float(v) for v in band.mean(axis=0))
+
     @staticmethod
     def shrink_box(box, x, y):
         # given box with 4 corner coordinates, returns new box coordinates shrunken by x and y percentages
