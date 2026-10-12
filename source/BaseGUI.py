@@ -213,9 +213,14 @@ class BaseGUI(ABC):
         fslider('Shadows:', 'shadow_density', -0.9, 0.9, 0.01)
         fslider('Highlights:', 'highlight_density', -0.5, 0.5, 0.01)
         self.paper_keys = ['neutral']
+        # UI-only toggle (no key: not a conversion parameter), paper controls hidden by default
+        self.paper_toggle = CheckLabel(exposureControls, 'Paper Settings:', row(), command=self.toggle_paper_settings)
         self.paper_combo = ComboLabel(exposureControls, 'Paper:', row(), ['Neutral'], 'paper_profile', self.widgets, output_list=self.paper_keys, width=25, command=skip)
         CheckLabel(exposureControls, 'Paper White:', row(), 'paper_dmin', self.widgets, command=skip)
         CheckLabel(exposureControls, 'Paper Black:', row(), 'paper_black', self.widgets, command=skip)
+        self.paper_widgets = [self.paper_combo, self.widgets['paper_dmin'], self.widgets['paper_black']]
+        for widget in self.paper_widgets:
+            widget.hide()
         fslider('White Point:', 'white_point_offset', -0.25, 0.25, 0.01)
         fslider('Black Point:', 'black_point_offset', -0.25, 0.25, 0.01)
         self.clip_widgets = [
@@ -771,7 +776,12 @@ class BaseGUI(ABC):
             self.rgb_display.grid_forget()
             self.base_pick_button.grid_forget()
             self.base_buttons_frame.grid_forget()
-    
+
+    def toggle_paper_settings(self, widget):
+        # Shows/hides the paper profile controls based on the toggle's state
+        for paper_widget in self.paper_widgets:
+            paper_widget.show() if widget.get() else paper_widget.hide()
+
     def set_flip(self, event=None):
         if self.glob_check.get():
             affected = sum([photo.use_global_settings for photo in self.photos])
